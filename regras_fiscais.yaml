@@ -1,0 +1,44 @@
+# regras_fiscais.yaml
+meta:
+  versao: "1.0"
+  descricao: "Conjunto básico de regras fiscais para validação e apoio a análises."
+
+tolerancias:
+  total_documento: 0.05   # R$ 0,05
+
+cfop:
+  "5101": "Venda de produção do estabelecimento"
+  "5102": "Venda de mercadoria adquirida de terceiros"
+  "5405": "Venda de mercadoria adquirida de terceiros, ST"
+
+cst_icms:
+  "00": "Tributada integralmente"
+  "10": "Tributada e com cobrança de ICMS por substituição tributária"
+  "20": "Com redução de base de cálculo"
+  "40": "Isenta"
+  "41": "Não tributada"
+  "60": "ICMS cobrado anteriormente - ST"
+  "90": "Outras"
+
+csosn_icms:
+  "101": "Tributada pelo Simples Nacional com permissão de crédito"
+  "102": "Tributada pelo Simples Nacional sem permissão de crédito"
+  "103": "Isenção do ICMS no Simples Nacional"
+  "201": "Com ST e permissão de crédito"
+  "202": "Com ST, sem permissão de crédito"
+  "900": "Outras"
+
+pis:
+  aliquotas_padrao:
+    saida: 1.65
+    entrada: 1.65
+
+cofins:
+  aliquotas_padrao:
+    saida: 7.60
+    entrada: 7.60
+
+ncm_exemplos:
+  "27101932": "Óleos lubrificantes"
+  "30049099": "Medicamentos"
+  "22030000": "Cervejas de malte"
