@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+langchain-core
+langchain-openai
+langchain-google-genai
+pillow
+pytesseract
+pdf2image
+plotly
+matplotlib
+cryptography
+pyyaml
