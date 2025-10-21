@@ -132,6 +132,41 @@ class BancoDeDados:
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS revisoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            documento_id INTEGER NOT NULL,
+            campo TEXT,
+            valor_anterior TEXT,
+            valor_corrigido TEXT,
+            usuario TEXT,
+            data_revisao TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
+        )
+        """)  
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT,
+            email TEXT UNIQUE,
+            perfil TEXT,
+            senha_hash TEXT
+        )
+        """) 
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS metricas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_documento TEXT,
+            acuracia_media REAL,
+            taxa_revisao REAL,
+            tempo_medio REAL,
+            taxa_erro REAL,
+            registrado_em TEXT DEFAULT (datetime('now'))
+        )
+        """) 
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             evento TEXT,
@@ -207,6 +242,35 @@ class BancoDeDados:
         self.conn.commit()
         return int(cur.lastrowid)
 
+    # --- Métodos CRUD para novas tabelas (Exemplo) ---
+    def inserir_revisao(self, **campos) -> int:
+        columns = ", ".join(campos.keys())
+        placeholders = ", ".join("?" for _ in campos)
+        sql = f"INSERT INTO revisoes ({columns}) VALUES ({placeholders})"
+        cur = self.conn.cursor()
+        cur.execute(sql, list(campos.values()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def inserir_metrica(self, **campos) -> int:
+        columns = ", ".join(campos.keys())
+        placeholders = ", ".join("?" for _ in campos)
+        sql = f"INSERT INTO metricas ({columns}) VALUES ({placeholders})"
+        cur = self.conn.cursor()
+        cur.execute(sql, list(campos.values()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def inserir_usuario(self, **campos) -> int:
+        columns = ", ".join(campos.keys())
+        placeholders = ", ".join("?" for _ in campos)
+        sql = f"INSERT INTO usuarios ({columns}) VALUES ({placeholders})"
+        cur = self.conn.cursor()
+        cur.execute(sql, list(campos.values()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+
     def log(self, evento: str, usuario: str, detalhes: str) -> None:
         self.conn.execute(
             "INSERT INTO logs (evento, usuario, detalhes) VALUES (?, ?, ?)",
@@ -228,7 +292,12 @@ class BancoDeDados:
         return dict(row) if row else None
 
     def query_table(self, table: str, where: Optional[str] = None) -> pd.DataFrame:
-        if table not in {"documentos", "itens", "impostos", "extracoes", "logs", "memoria"}:
+        # Adiciona as novas tabelas à lista de tabelas permitidas
+        allowed_tables = {
+            "documentos", "itens", "impostos", "extracoes",
+            "logs", "memoria", "revisoes", "usuarios", "metricas"
+        }
+        if table not in allowed_tables:
             raise ValueError(f"Tabela não suportada: {table}")
         sql = f"SELECT * FROM {table}"
         if where:

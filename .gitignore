@@ -1,0 +1,41 @@
+# Arquivos de ambiente virtual
+venv/
+/venv/
+__pypackages__/
+.env
+
+# Arquivos de cache e compilados do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pastas de IDEs e editores de código
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+
+# Arquivos de sistema operacional
+.DS_Store
+Thumbs.db
+
+# Arquivos de cache do Streamlit
+.streamlit/
+
+# Arquivos de pacotes e dependências locais
+*.egg-info/
+dist/
+build/
+wheels/
+*.tar.gz
+*.egg
+
+# Arquivos de log e bancos de dados
+*.log
+*.sqlite3
+*.db
+
+# Arquivos de configuração local (se houver)
+config.ini
