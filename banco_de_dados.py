@@ -36,6 +36,11 @@ class BancoDeDados:
         self.db_path = Path(db_path)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Garante que restrições de chave estrangeira (incluindo ON DELETE CASCADE) estejam ativas no SQLite
+        try:
+            self.conn.execute("PRAGMA foreign_keys = ON")
+        except sqlite3.DatabaseError:
+            pass  # Em último caso, prossegue sem interromper a inicialização
         self._criar_schema()
 
     # ------------------------- Infra & utilidades -------------------------
