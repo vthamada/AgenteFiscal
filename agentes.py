@@ -21,20 +21,32 @@ if TYPE_CHECKING:
     from seguranca import Cofre # Importação direta para TYPE_CHECKING
 
 # OCR / Imaging (ativados quando instalados no ambiente)
-try:
-    import pytesseract  # type: ignore
-    from PIL import Image, ImageOps, ImageFilter # type: ignore
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
-    logging.warning("Bibliotecas Pillow ou pytesseract não encontradas. Funcionalidade de OCR de imagens desativada.")
+OCR_AVAILABLE = False
+PDF_AVAILABLE = False
+PDF_RENDERER = None  # 'pdfium' ou 'pdf2image'
 
 try:
-    from pdf2image import convert_from_bytes # type: ignore
+    import easyocr  # type: ignore
+    import numpy as np  # type: ignore
+    from PIL import Image  # type: ignore
+    OCR_AVAILABLE = True
+except Exception as e:
+    OCR_AVAILABLE = False
+    logging.warning(f"EasyOCR não disponível: {e}. OCR de imagens/pdf ficará desativado.")
+
+# Renderização de PDF -> imagem (preferir pypdfium2; usar pdf2image como fallback)
+try:
+    import pypdfium2 as pdfium  # type: ignore
     PDF_AVAILABLE = True
-except ImportError:
-    PDF_AVAILABLE = False
-    logging.warning("Biblioteca pdf2image não encontrada. Funcionalidade de OCR de PDF desativada.")
+    PDF_RENDERER = "pdfium"
+except Exception:
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore
+        PDF_AVAILABLE = True
+        PDF_RENDERER = "pdf2image"
+    except Exception as e:
+        PDF_AVAILABLE = False
+        logging.warning(f"Nenhum renderizador de PDF disponível (pypdfium2/pdf2image). Detalhe: {e}")
 
 # LLM
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -148,8 +160,9 @@ class AgenteXMLParser:
             log.warning("Falha ao parsear XML '%s': %s", nome, e)
             motivo_rejeicao = f"XML mal formado: {e}"
             status = "quarentena"
+            tipo = "xml/invalido"
             doc_id = self.db.inserir_documento(
-                nome_arquivo=nome, tipo="xml/invalido", origem=origem,
+                nome_arquivo=nome, tipo=tipo, origem=origem,
                 hash=self.db.hash_bytes(conteudo), status=status,
                 data_upload=self.db.now(), motivo_rejeicao=motivo_rejeicao
             )
@@ -323,54 +336,104 @@ class AgenteXMLParser:
                     if val is not None: self.db.inserir_imposto(item_id=item_id, tipo_imposto="COFINS", cst=cst, origem=None, base_calculo=_to_float_br(bc), aliquota=_to_float_br(aliq), valor=_to_float_br(val))
 
 
-# ------------------------------ Agente OCR (Sem alterações) ------------------------------
+# ------------------------------ Agente OCR (EasyOCR + pypdfium2 com fallback) ------------------------------
 class AgenteOCR:
     def __init__(self):
-        self.ocr_ok = OCR_AVAILABLE; self.pdf_ok = PDF_AVAILABLE
-        if self.ocr_ok: log.info("OCR (Tesseract/Pillow) disponível.")
-        else: log.warning("OCR (Tesseract/Pillow) NÃO disponível.")
-        if self.pdf_ok: log.info("Conversor PDF (pdf2image) disponível.")
-        else: log.warning("Conversor PDF (pdf2image) NÃO disponível.")
+        self.ocr_ok = OCR_AVAILABLE
+        self.pdf_ok = PDF_AVAILABLE
+        self.reader = None
+
+        if self.ocr_ok:
+            try:
+                # GPU=False para funcionar no Streamlit Cloud/CPU
+                self.reader = easyocr.Reader(["pt", "en"], gpu=False)  # cacheia modelos
+                log.info("OCR (EasyOCR) disponível.")
+            except Exception as e:
+                self.ocr_ok = False
+                log.warning(f"Falha ao inicializar EasyOCR: {e}")
+        else:
+            log.warning("OCR (EasyOCR) NÃO disponível.")
+
+        if self.pdf_ok:
+            if PDF_RENDERER == "pdfium":
+                log.info("Renderizador PDF: pypdfium2.")
+            elif PDF_RENDERER == "pdf2image":
+                log.info("Renderizador PDF: pdf2image.")
+        else:
+            log.warning("Nenhum renderizador de PDF disponível.")
+
     def reconhecer(self, nome: str, conteudo: bytes) -> Tuple[str, float]:
-        t_start=time.time(); ext=Path(nome).suffix.lower(); texto=""; conf=0.0
+        t_start = time.time()
+        ext = Path(nome).suffix.lower()
+        texto = ""
+        conf = 0.0
+
         try:
-            if ext==".pdf":
-                if not self.pdf_ok: raise RuntimeError("pdf2image ausente.")
+            if ext == ".pdf":
+                if not (self.ocr_ok and self.pdf_ok):
+                    raise RuntimeError("OCR PDF indisponível (EasyOCR ou renderizador de PDF ausente).")
                 texto, conf = self._ocr_pdf(conteudo)
-            elif ext in {".jpg",".jpeg",".png",".tif",".tiff",".bmp"}:
-                if not self.ocr_ok: raise RuntimeError("pytesseract/Pillow ausentes.")
+            elif ext in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}:
+                if not self.ocr_ok:
+                    raise RuntimeError("OCR imagem indisponível (EasyOCR ausente).")
                 texto, conf = self._ocr_imagem(conteudo)
-            else: raise ValueError(f"Extensão não suportada: {ext}")
-        except Exception as e: log.error("Erro OCR '%s': %s", nome, e); raise e
-        finally: log.info("OCR '%s' (conf: %.2f) em %.2fs", nome, conf, time.time()-t_start)
+            else:
+                raise ValueError(f"Extensão não suportada: {ext}")
+        except Exception as e:
+            log.error("Erro OCR '%s': %s", nome, e)
+            raise e
+        finally:
+            log.info("OCR '%s' (conf: %.2f) em %.2fs", nome, conf, time.time() - t_start)
         return texto, conf
-    def _preprocess_image(self, img: Image.Image) -> Image.Image:
-        try: gray=img.convert('L'); bw=gray.point(lambda x:0 if x<180 else 255,'1'); return bw
-        except Exception as e: log.warning("Falha preprocess: %s", e); return img
+
     def _ocr_imagem(self, conteudo: bytes) -> Tuple[str, float]:
-        if not self.ocr_ok: return "", 0.0
+        """OCR para imagens com EasyOCR."""
+        if not (self.ocr_ok and self.reader):
+            return "", 0.0
         try:
-            img=Image.open(io.BytesIO(conteudo)); img_proc=self._preprocess_image(img)
-            ocr_data=pytesseract.image_to_data(img_proc, lang='por', config='--psm 6', output_type=pytesseract.Output.DICT)
-            confidences=[int(c) for i,c in enumerate(ocr_data['conf']) if int(c)>-1 and ocr_data['text'][i].strip()]
-            avg_conf=sum(confidences)/len(confidences) if confidences else 0.0
-            texto=pytesseract.image_to_string(img_proc, lang='por', config='--psm 6')
-            return texto, round(avg_conf/100.0, 2)
-        except Exception as e: log.error("Erro OCR imagem: %s", e); return "", 0.0
+            img = Image.open(io.BytesIO(conteudo)).convert("RGB")
+            np_img = np.array(img)
+            results = self.reader.readtext(np_img, detail=1, paragraph=False)
+            texto = " ".join([r[1] for r in results]) if results else ""
+            confs = [float(r[2]) for r in results] if results else []
+            media = float(np.mean(confs)) if confs else 0.0
+            return texto, round(media, 2)
+        except Exception as e:
+            log.error(f"Erro OCR imagem (EasyOCR): {e}")
+            return "", 0.0
+
     def _ocr_pdf(self, conteudo: bytes) -> Tuple[str, float]:
-        if not self.pdf_ok: return "", 0.0
+        """OCR para PDFs: renderiza cada página -> PIL e aplica EasyOCR."""
+        if not (self.ocr_ok and self.reader and self.pdf_ok):
+            return "", 0.0
         try:
-            images=convert_from_bytes(conteudo, dpi=200); full_text=[]; total_conf=0.0; num_valid_pages=0
-            for i, img in enumerate(images):
-                log.debug("OCR página %d PDF", i+1); img_proc=self._preprocess_image(img)
-                ocr_data=pytesseract.image_to_data(img_proc, lang='por', config='--psm 6', output_type=pytesseract.Output.DICT)
-                confidences=[int(c) for idx,c in enumerate(ocr_data['conf']) if int(c)>-1 and ocr_data['text'][idx].strip()]
-                if confidences: avg_conf_page=sum(confidences)/len(confidences); total_conf+=avg_conf_page; num_valid_pages+=1
-                page_text=pytesseract.image_to_string(img_proc, lang='por', config='--psm 6'); full_text.append(page_text)
-            final_text="\n\n--- Page Break ---\n\n".join(full_text)
-            final_avg_conf=(total_conf/num_valid_pages) if num_valid_pages>0 else 0.0
-            return final_text, round(final_avg_conf/100.0, 2)
-        except Exception as e: log.error("Erro OCR PDF: %s", e); return "", 0.0
+            full_text = []
+            confs_all: List[float] = []
+
+            if PDF_RENDERER == "pdfium":
+                pdf = pdfium.PdfDocument(io.BytesIO(conteudo))
+                for page in pdf:
+                    # scale=2 dá ~144 dpi * 2 (boa leitura) sem estourar memória
+                    pil_img = page.render(scale=2).to_pil().convert("RGB")
+                    np_img = np.array(pil_img)
+                    results = self.reader.readtext(np_img, detail=1, paragraph=False)
+                    full_text.append(" ".join([r[1] for r in results]) if results else "")
+                    confs_all.extend([float(r[2]) for r in results] if results else [])
+            else:  # PDF_RENDERER == "pdf2image"
+                images = convert_from_bytes(conteudo, dpi=220)
+                for pil_img in images:
+                    pil_img = pil_img.convert("RGB")
+                    np_img = np.array(pil_img)
+                    results = self.reader.readtext(np_img, detail=1, paragraph=False)
+                    full_text.append(" ".join([r[1] for r in results]) if results else "")
+                    confs_all.extend([float(r[2]) for r in results] if results else [])
+
+            texto_final = "\n\n--- Page Break ---\n\n".join([t for t in full_text if t])
+            media_conf = float(np.mean(confs_all)) if confs_all else 0.0
+            return texto_final, round(media_conf, 2)
+        except Exception as e:
+            log.error(f"Erro OCR PDF (EasyOCR): {e}")
+            return "", 0.0
 
 # ------------------------------ Agente NLP (Extração de Itens OCR Mantida) ------------------------------
 class AgenteNLP:
@@ -502,6 +565,7 @@ class AgenteAnalitico:
         7.  GRÁFICOS: Prefira `plotly.express as px`. Use `fig.update_layout(width=800, height=500)` para ajustar o tamanho. Para `matplotlib.pyplot as plt`, use `fig, ax = plt.subplots(figsize=(10, 6))` e `plt.tight_layout()` antes de retornar `fig`.
         8.  Se retornar uma `tabela` (DataFrame), o `texto` deve ser um resumo ou título, NÃO a tabela convertida para string (`.to_string()`).
         9.  Manipule datas com `pd.to_datetime(df['coluna_data'], errors='coerce')`.
+        10. Os dados de CNPJ/CPF estarão CRIPTOGRAFADOS. Você não pode usá-los para filtros de igualdade ou agrupamento direto. Use outras colunas (UF, tipo, data, valores).
 
         **ESQUEMA DISPONÍVEL:**
         {schema}
@@ -574,7 +638,7 @@ class AgenteAnalitico:
         3.  Certifique-se de que `.copy()` foi usado ao acessar DataFrames do `catalog`.
         4.  Revise o acesso a colunas e tratamento de tipos (use `pd.to_numeric`, `pd.to_datetime` com `errors='coerce'`). Verifique a existência de colunas.
         5.  Garanta que funções built-in não seguras não foram usadas.
-        6.  Verifique a lógica da análise para possíveis erros (divisão por zero, índices inválidos, etc.). Corrija o erro reportado.
+        6.  Lembre-se que CNPJ/CPF estão criptografados e não podem ser usados para filtros de igualdade.
         7.  Mantenha a estrutura de retorno `(texto, tabela, figura)`.
         8.  Inclua tratamento de erro `try...except Exception as e:` dentro da função `solve` para retornar mensagens de erro amigáveis.
 
@@ -635,6 +699,8 @@ class AgenteAnalitico:
         """ Executa o código em sandbox seguro com escopo unificado e builtins restritos (Código Completo). """
         scope = {"__builtins__": SAFE_BUILTINS}
         try:
+            scope = {"__builtins__": SAFE_BUILTINS.copy()}
+            scope["__builtins__"]["__import__"] = _restricted_import
             exec(code, scope)
         except SecurityException as se:
             log.error(f"Tentativa de execução insegura bloqueada: {se}")
@@ -722,27 +788,25 @@ class AgenteAnalitico:
             }
 
 
-# ------------------------------ Orchestrator (Integrado com Criptografia) ------------------------------
+# ------------------------------ Orchestrator (Com Filtros, Modo Seguro, Reprocessamento e Métricas) ------------------------------
 @dataclass
 class Orchestrator:
     """ Coordena o pipeline de processamento, criptografa dados e gerencia análise. """
     db: "BancoDeDados"
-    validador: "ValidadorFiscal" # Agora será instanciado com o Cofre
+    validador: "ValidadorFiscal"
     memoria: "MemoriaSessao"
     llm: Optional[BaseChatModel] = None
-    cofre: "Cofre" = None # Instância do Cofre
-    metrics_agent: "MetricsAgent" = None # Instância do Agente de Métricas
+    cofre: "Cofre" = None
+    metrics_agent: "MetricsAgent" = None # Agente de Métricas
 
     def __post_init__(self):
-        """Inicializa os agentes e o Cofre."""
+        """Inicializa os agentes, Cofre e Metrics."""
         if not CORE_MODULES_AVAILABLE:
              log.error("Orchestrator: Módulos CORE ausentes.")
-             self.cofre = Cofre(key=None) # Cria cofre dummy
-             # Instancia validador (dummy) mesmo se core falhar, para evitar AttributeError
-             self.validador = ValidadorFiscal(cofre=self.cofre) 
+             self.cofre = Cofre(key=None)
+             self.validador = ValidadorFiscal(cofre=self.cofre)
         else:
-             # --- Carrega a Chave e Inicializa o Cofre ---
-             chave_criptografia = carregar_chave_do_env("APP_SECRET_KEY") # Tenta carregar da env var
+             chave_criptografia = carregar_chave_do_env("APP_SECRET_KEY")
              self.cofre = Cofre(key=chave_criptografia)
              if self.cofre.available: log.info("Criptografia ATIVA.")
              else:
@@ -750,16 +814,14 @@ class Orchestrator:
                  if not CRYPTO_OK: log.warning("-> Lib 'cryptography' ausente.")
                  if not chave_criptografia: log.warning("-> Var APP_SECRET_KEY ausente/inválida.")
              
-             # --- CORREÇÃO APLICADA AQUI ---
-             # Instancia o ValidadorFiscal PRIMEIRO, passando o cofre
+             # Instancia o Validador PRIMEIRO, passando o cofre
              self.validador = ValidadorFiscal(cofre=self.cofre)
-             # -----------------------------
 
-        # Instancia o Agente de Métricas (mesmo que seja placeholder)
+        # Instancia o Agente de Métricas
         self.metrics_agent = MetricsAgent()
 
-        # Agora instancia os outros agentes, passando o validador já criado e o cofre para o XMLAgent
-        self.xml_agent = AgenteXMLParser(self.db, self.validador, self.cofre, self.metrics_agent) # Passa db, validador, cofre, metrics
+        # Passa o validador, cofre e metrics_agent para o XMLAgent
+        self.xml_agent = AgenteXMLParser(self.db, self.validador, self.cofre, self.metrics_agent)
         self.ocr_agent = AgenteOCR()
         self.nlp_agent = AgenteNLP()
         self.analitico = AgenteAnalitico(self.llm, self.memoria) if self.llm else None
@@ -770,36 +832,47 @@ class Orchestrator:
 
     def ingestir_arquivo(self, nome: str, conteudo: bytes, origem: str = "web") -> int:
         """ Processa um arquivo, retornando o ID do documento. """
-        t_start=time.time(); doc_id=-1; status="erro"; motivo="?"; doc_hash=self.db.hash_bytes(conteudo); ext=Path(nome).suffix.lower()
+        t_start=time.time(); doc_id=-1; status="erro"; motivo="?"; doc_hash=self.db.hash_bytes(conteudo); ext=Path(nome).suffix.lower(); tipo_doc = ext.strip('.') or 'binario'
         try:
             existing_id=self.db.find_documento_by_hash(doc_hash)
             if existing_id: log.info("Doc '%s' (hash %s...) já existe ID %d. Ignorando.", nome, doc_hash[:8], existing_id); return existing_id
-            if ext==".xml": doc_id=self.xml_agent.processar(nome, conteudo, origem)
-            elif ext in {".pdf",".jpg",".jpeg",".png",".tif",".tiff",".bmp"}: doc_id=self._processar_midias(nome, conteudo, origem)
+            
+            if ext==".xml":
+                tipo_doc = "xml" # Será refinado pelo parser
+                doc_id=self.xml_agent.processar(nome, conteudo, origem)
+            elif ext in {".pdf",".jpg",".jpeg",".png",".tif",".tiff",".bmp"}: 
+                doc_id=self._processar_midias(nome, conteudo, origem)
+                tipo_doc = Path(nome).suffix.lower().strip('.') # Tipo é definido dentro de _processar_midias
             else:
                 motivo=f"Extensão '{ext}' não suportada."; status="quarentena"; log.warning("Arquivo '%s' rejeitado: %s", nome, motivo)
-                doc_id=self.db.inserir_documento(nome_arquivo=nome, tipo="desconhecido", origem=origem, hash=doc_hash, status=status, data_upload=self.db.now(), motivo_rejeicao=motivo)
+                tipo_doc = "desconhecido"
+                doc_id=self.db.inserir_documento(nome_arquivo=nome, tipo=tipo_doc, origem=origem, hash=doc_hash, status=status, data_upload=self.db.now(), motivo_rejeicao=motivo)
                 # Registra métrica para arquivo não suportado
-                self.metrics_agent.registrar_metrica(db=self.db, tipo_documento=f"desconhecido ({ext})", status=status, confianca_media=0.0, tempo_medio=(time.time()-t_start))
-                
-            if doc_id > 0 and status != "quarentena": # Status já definido se for quarentena
+                self.metrics_agent.registrar_metrica(db=self.db, tipo_documento=tipo_doc, status=status, confianca_media=0.0, tempo_medio=(time.time()-t_start))
+            
+            if doc_id > 0:
                 doc_info=self.db.get_documento(doc_id);
-                if doc_info: status = doc_info.get("status", status)
+                if doc_info: status = doc_info.get("status", status) # Pega o status final pós-processamento
+        
         except Exception as e:
             log.exception("Falha ingestão '%s': %s", nome, e); motivo=f"Erro: {str(e)}"; status="erro"
             try: # Garante registro do erro
                 existing_id_on_error=self.db.find_documento_by_hash(doc_hash)
                 if existing_id_on_error: doc_id=existing_id_on_error; self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=motivo)
                 elif doc_id > 0: self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=motivo)
-                else: doc_id=self.db.inserir_documento(nome_arquivo=nome, tipo=ext.strip('.')or'binario', origem=origem, hash=doc_hash, status="erro", data_upload=self.db.now(), motivo_rejeicao=motivo)
+                else: doc_id=self.db.inserir_documento(nome_arquivo=nome, tipo=tipo_doc, origem=origem, hash=doc_hash, status="erro", data_upload=self.db.now(), motivo_rejeicao=motivo)
                 # Registra métrica de falha geral
-                self.metrics_agent.registrar_metrica(db=self.db, tipo_documento=ext.strip('.'), status="erro", confianca_media=0.0, tempo_medio=(time.time()-t_start))
+                self.metrics_agent.registrar_metrica(db=self.db, tipo_documento=tipo_doc, status="erro", confianca_media=0.0, tempo_medio=(time.time()-t_start))
             except Exception as db_err: log.error("Erro CRÍTICO ao registrar falha '%s': %s", nome, db_err); return -1
-        finally: log.info("Ingestão '%s' (ID: %d, Status: %s, Crypto: %s) em %.2fs", nome, doc_id, status, 'on' if self.cofre.available else 'off', time.time()-t_start)
+        
+        finally: 
+            # O registro de métricas agora é feito dentro dos métodos processar/midias
+            log.info("Ingestão '%s' (ID: %d, Status: %s, Crypto: %s) em %.2fs", nome, doc_id, status, 'on' if self.cofre.available else 'off', time.time()-t_start)
+        
         return doc_id
 
     def _processar_midias(self, nome: str, conteudo: bytes, origem: str) -> int:
-        """ Processa PDF/Imagem via OCR/NLP com criptografia. """
+        """ Processa PDF/Imagem via OCR/NLP com criptografia e registro de métricas. """
         doc_id = -1; t_start_proc = time.time(); status_final = "erro"; conf = 0.0; tipo_doc = Path(nome).suffix.lower().strip('.')
         try:
             doc_id = self.db.inserir_documento(
@@ -825,7 +898,11 @@ class Orchestrator:
                     # --- CRIPTOGRAFIA ANTES DE ATUALIZAR ---
                     campos_para_criptografar=["emitente_cnpj","destinatario_cnpj","emitente_cpf","destinatario_cpf"]
                     for campo in campos_para_criptografar:
-                        if campo in campos_nlp and campos_nlp[campo]: campos_nlp[campo]=self.cofre.encrypt_text(campos_nlp[campo])
+                        if campo in campos_nlp and campos_nlp[campo]:
+                            if getattr(self.cofre, "available", False):
+                                campos_nlp[campo] = self.cofre.encrypt_text(campos_nlp[campo])
+                            else:
+                                log.warning(f"Criptografia desativada - campo '{campo}' salvo em texto puro.")
                     # ----------------------------------------
                     self.db.atualizar_documento_campos(doc_id, **campos_nlp) # Salva dados (cripto ou não)
                     if itens_ocr:
@@ -849,7 +926,6 @@ class Orchestrator:
             else: 
                 status_final="revisao_pendente"; log.warning(f"OCR s/ texto doc_id {doc_id} (conf:{conf:.2f}). Revisão pendente."); self.db.atualizar_documento_campos(doc_id, status=status_final, motivo_rejeicao="OCR não extraiu texto.")
             
-            # Atualiza o status final (se não foi erro capturado acima)
             if status_final != "erro": self.db.atualizar_documento_campo(doc_id,"status",status_final)
             self.db.log("ingestao_midias","sistema",f"doc_id={doc_id}|conf={conf:.2f}|status={status_final}|crypto={'on' if self.cofre.available else 'off'}")
         
@@ -870,21 +946,65 @@ class Orchestrator:
                 )
         return doc_id
 
+    def _executar_fast_query(self, pergunta: str, catalog: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+        """
+        Simula o FastQueryAgent . Executa consultas determinísticas simples
+        usando Pandas, sem LLM.
+        """
+        log.info(f"Modo Seguro: Tentando responder com FastQuery: '{pergunta}'")
+        pergunta_lower = pergunta.lower()
+        df_docs = catalog.get("documentos")
+        df_itens = catalog.get("itens")
+        
+        texto_resposta = "Não foi possível responder a esta pergunta com o 'Modo Seguro' (FastQueryAgent)."
+        tabela_resposta = None
+        
+        try:
+            if "contar" in pergunta_lower and "documentos" in pergunta_lower:
+                total_docs = len(df_docs) if df_docs is not None else 0
+                texto_resposta = f"Total de documentos (processados/revisados) no escopo atual: **{total_docs}**."
+            
+            elif ("valor total" in pergunta_lower or "soma" in pergunta_lower) and "documentos" in pergunta_lower:
+                if df_docs is not None and 'valor_total' in df_docs.columns:
+                    # Garante que a coluna é numérica antes de somar
+                    df_docs['valor_total_num'] = pd.to_numeric(df_docs['valor_total'], errors='coerce').fillna(0)
+                    soma_total = df_docs['valor_total_num'].sum()
+                    texto_resposta = f"O valor total somado dos documentos no escopo é: **R$ {soma_total:,.2f}**."
+                else:
+                    texto_resposta = "A coluna 'valor_total' não está disponível nos documentos para soma."
+
+            elif ("top 5" in pergunta_lower or "top 10" in pergunta_lower) and "valor" in pergunta_lower:
+                 n_top = 10 if "top 10" in pergunta_lower else 5
+                 if df_docs is not None and 'valor_total' in df_docs.columns and 'emitente_nome' in df_docs.columns:
+                     df_docs['valor_total_num'] = pd.to_numeric(df_docs['valor_total'], errors='coerce').fillna(0)
+                     top_fornecedores = df_docs.groupby('emitente_nome')['valor_total_num'].sum().nlargest(n_top).reset_index()
+                     top_fornecedores = top_fornecedores.rename(columns={"valor_total_num": "Valor Total"})
+                     texto_resposta = f"Top {n_top} Emitentes por Valor Total:"
+                     tabela_resposta = top_fornecedores
+                 else:
+                     texto_resposta = f"Não foi possível calcular o Top {n_top} (colunas 'emitente_nome' ou 'valor_total' ausentes)."
+            
+            # Adicionar outras regras determinísticas aqui (ex: contagem por UF)
+            
+        except Exception as e:
+            log.error(f"Erro no FastQuery: {e}")
+            texto_resposta = f"Ocorreu um erro ao tentar executar a consulta rápida: {e}"
+
+        return {
+            "texto": texto_resposta,
+            "tabela": tabela_resposta,
+            "figuras": [],
+            "duracao_s": 0.01, # Simulado, pois é rápido
+            "code": f"# FastQuery (Determinístico)\n# Pergunta: {pergunta}",
+            "agent_name": "FastQueryAgent (Modo Seguro)"
+        }
 
     def responder_pergunta(self, pergunta: str, scope_filters: Optional[Dict[str, Any]] = None, safe_mode: bool = False) -> Dict[str, Any]:
-        """ Delega a pergunta analítica para o AgenteAnalitico. (Código Completo com Filtros) """
-        if not self.analitico:
+        """ Delega a pergunta analítica para o AgenteAnalitico ou FastQueryAgent. (Código Completo com Filtros) """
+        if not self.analitico and not safe_mode: # Precisa do analítico se não for modo seguro
             log.error("Agente Analítico não inicializado.")
             return {"texto": "Erro: Agente analítico não configurado.", "tabela": None, "figuras": []}
         
-        # --- Lógica de Modo Seguro (Placeholder) ---
-        if safe_mode:
-            log.info("Modo Seguro ativado. Geração de código desativada.")
-            # TODO: Implementar lógica de "FastQueryAgent" (ferramentas determinísticas)
-            # Por enquanto, apenas retorna uma mensagem
-            return {"texto": "Modo Seguro ativado. A execução de código dinâmico está desabilitada. (Funcionalidade de 'ferramentas rápidas' ainda não implementada).", "tabela": None, "figuras": []}
-        # ---------------------------------------------
-
         catalog: Dict[str, pd.DataFrame] = {}
         try:
             # Constrói cláusula WHERE base
@@ -894,12 +1014,10 @@ class Orchestrator:
             if scope_filters:
                 uf_escopo = scope_filters.get('uf')
                 if uf_escopo and isinstance(uf_escopo, str):
-                    # Adiciona filtro de UF (assumindo que 'uf' é uma coluna em 'documentos')
-                    where_conditions.append(f"uf = '{uf_escopo.upper()}'") # Garante upppercase
+                    where_conditions.append(f"uf = '{uf_escopo.upper()}'")
                 
                 tipo_escopo = scope_filters.get('tipo')
                 if tipo_escopo and isinstance(tipo_escopo, list) and len(tipo_escopo) > 0:
-                    # Cria uma lista de tipos formatados para SQL (ex: "'NFe', 'PDF'")
                     tipos_sql = ", ".join([f"'{t}'" for t in tipo_escopo])
                     where_conditions.append(f"tipo IN ({tipos_sql})")
             
@@ -917,7 +1035,6 @@ class Orchestrator:
                     catalog["impostos"] = self.db.query_table("impostos", where=f"item_id IN ({item_ids_sql})")
                  else: catalog["impostos"] = pd.DataFrame(columns=['id','item_id','tipo_imposto','cst','origem','base_calculo','aliquota','valor'])
             else:
-                 # Define DFs vazios com schema esperado se não houver documentos válidos
                  catalog["itens"] = pd.DataFrame(columns=['id','documento_id','descricao','ncm','cest','cfop','quantidade','unidade','valor_unitario','valor_total','codigo_produto'])
                  catalog["impostos"] = pd.DataFrame(columns=['id','item_id','tipo_imposto','cst','origem','base_calculo','aliquota','valor'])
         except Exception as e:
@@ -926,9 +1043,19 @@ class Orchestrator:
         if catalog["documentos"].empty:
             log.info("Nenhum documento válido para análise (considerando filtros)."); return {"texto": "Não há documentos válidos (status 'processado' ou 'revisado') que correspondam aos filtros selecionados para análise.", "tabela": None, "figuras": []}
         
+        # --- Lógica de Modo Seguro (FastQueryAgent) ---
+        if safe_mode:
+            # Tenta responder com lógica determinística
+            return self._executar_fast_query(pergunta, catalog)
+        # ---------------------------------------------
+
+        # Se safe_mode=False, continua para o AgenteAnalitico (LLM)
+        if not self.analitico:
+             log.error("Modo Seguro desativado, mas Agente Analítico (LLM) não está configurado.")
+             return {"texto": "Erro: Modo Seguro desativado, mas o Agente Analítico (LLM) não está configurado.", "tabela": None, "figuras": []}
+
         log.info("Iniciando AgenteAnalitico (Filtros: %s): '%s...'", scope_filters, pergunta[:100])
         # Passa o catálogo filtrado para o agente
-        # NOTA: Dados sensíveis (CNPJ/CPF) no catálogo estarão CRIPTOGRAFADOS.
         return self.analitico.responder(pergunta, catalog)
 
 
@@ -983,6 +1110,13 @@ class Orchestrator:
             # (Opcional: deletar o arquivo físico antigo de /data/uploads se o hash for mudar ou para limpar)
             # Por enquanto, vamos manter o arquivo original no lugar.
 
+            try:
+                if caminho_arquivo.exists():
+                    caminho_arquivo.unlink()
+                    log.info(f"Arquivo físico '{caminho_arquivo}' removido durante reprocessamento.")
+            except Exception as e_clean:
+                log.warning(f"Não foi possível excluir arquivo físico '{caminho_arquivo}': {e_clean}")
+
             # Re-ingere o arquivo
             log.info(f"Re-ingerindo arquivo '{nome_arquivo_original}'...")
             novo_doc_id = self.ingestir_arquivo(
@@ -991,6 +1125,12 @@ class Orchestrator:
                 origem=origem_original
             )
             
+            # Verifica se a re-ingestão falhou (ex: hash já existe - o que não deveria acontecer)
+            if novo_doc_id == documento_id:
+                 msg = f"Reprocessamento falhou. O documento ID {documento_id} não pôde ser deletado e re-inserido."
+                 log.error(msg)
+                 return {"ok": False, "mensagem": msg}
+
             novo_doc_info = self.db.get_documento(novo_doc_id)
             novo_status = novo_doc_info.get('status') if novo_doc_info else 'desconhecido'
 
@@ -1003,15 +1143,15 @@ class Orchestrator:
             log.exception(f"Falha ao reprocessar doc_id {documento_id}: {e}")
             return {"ok": False, "mensagem": f"Falha ao reprocessar: {e}"}
 
-# ------------------------------ Agente de Métricas (Placeholder) ------------------------------
+# ------------------------------ Agente de Métricas (Implementação) ------------------------------
 
 class MetricsAgent:
     """
     Agente responsável por calcular e persistir métricas de performance e qualidade.
-    (Implementação placeholder conforme arquitetura)
+    (Implementação baseada na arquitetura)
     """
     def __init__(self):
-        log.info("MetricsAgent inicializado (placeholder).")
+        log.info("MetricsAgent inicializado.")
         # Em uma implementação real, poderia carregar estado ou configurações
         pass
 
@@ -1025,7 +1165,7 @@ class MetricsAgent:
         try:
             # Simplificação: Calcula taxas de revisão/erro baseado no status
             taxa_revisao = 1.0 if status == 'revisao_pendente' else 0.0
-            taxa_erro = 1.0 if status == 'erro' else 0.0
+            taxa_erro = 1.0 if status in ('erro', 'quarentena') else 0.0
             
             # Insere um registro individual na tabela de métricas
             # Uma implementação robusta faria agregação (ex: Média por hora/dia/tipo)

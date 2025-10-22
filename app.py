@@ -1,256 +1,290 @@
 # app.py
-
 from __future__ import annotations
 from pathlib import Path
-import io
 import traceback
 import streamlit as st
 import pandas as pd
-import os # Importado para ler variáveis de ambiente
+import os  # variáveis de ambiente
 
 # Importações do projeto
 from banco_de_dados import BancoDeDados
 from validacao import ValidadorFiscal
 from memoria import MemoriaSessao
 from agentes import Orchestrator
-# Importações para configuração do LLM
-from modelos_llm import make_llm, GEMINI_MODELS, OPENAI_MODELS, OPENROUTER_MODELS
-from langchain_core.language_models import BaseChatModel
-# Importações para Criptografia e Mascaramento
-from seguranca import Cofre, carregar_chave_do_env, mascarar_documento_fiscal, CRYPTO_OK, sha256_text # Importa sha256_text para senhas
 
+from dotenv import load_dotenv
+
+# LLM
+from modelos_llm import make_llm, GEMINI_MODELS, OPENAI_MODELS, OPENROUTER_MODELS
+
+# Segurança / Cripto
+from seguranca import Cofre, carregar_chave_do_env, mascarar_documento_fiscal, CRYPTO_OK, sha256_text
+
+# Configuração da página (uma única vez, no topo)
 st.set_page_config(page_title="Projeto Fiscal - I2A2", layout="wide")
 
-# Define o caminho para as regras fiscais
 REGRAS_FISCAIS_PATH = Path("regras_fiscais.yaml")
 
-# --- Estado da Sessão ---
-# Inicializa o estado da sessão para armazenar dados editáveis e ID selecionado
-if 'edited_doc_data' not in st.session_state:
-    st.session_state.edited_doc_data = {}
-if 'edited_items_data' not in st.session_state:
-    st.session_state.edited_items_data = pd.DataFrame()
-if 'doc_id_revisao' not in st.session_state:
-    st.session_state.doc_id_revisao = 0
-if 'llm_instance' not in st.session_state:
-    st.session_state.llm_instance = None
-if 'llm_status_message' not in st.session_state:
-    st.session_state.llm_status_message = "LLM não configurado."
-if 'app_cofre' not in st.session_state:
-    st.session_state.app_cofre = None # Armazena o Cofre na sessão
-if 'toast_exibido' not in st.session_state: # --- Adicionado para controle do toast ---
-    st.session_state.toast_exibido = False
+load_dotenv()
 
-# --- Configuração dos Serviços ---
+# ---------------------- Estado da sessão (idempotente) ----------------------
+def _ensure_session_defaults():
+    defaults = {
+        "edited_doc_data": {},
+        "edited_items_data": pd.DataFrame(),
+        "doc_id_revisao": 0,
+        "llm_instance": None,
+        "llm_status_message": "LLM não configurado.",
+        "app_cofre": None,
+        "toast_exibido": False,
+        "logged_in": False,
+        "user_profile": None,
+        "user_name": None,
+        "admin_just_created": False,
+        "edited_users_data": pd.DataFrame(),
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-@st.cache_resource # Cacheia todos os serviços base (DB, Memoria, Cofre, Validador)
+
+_ensure_session_defaults()
+
+
+# ---------------------- Serviços (cacheados) ----------------------
+@st.cache_resource
 def get_core_services():
     """
-    Inicializa e cacheia os serviços centrais que não mudam durante a sessão.
-    Isso inclui DB, Memoria, Cofre e o Validador (que depende do Cofre e das Regras).
+    Inicializa DB, Memoria, Cofre, Validador e cria admin padrão se necessário.
     """
     db = BancoDeDados()
     memoria = MemoriaSessao(db)
-    
-    # Carrega a chave *uma vez* e instancia o Cofre
+
+    # Seed admin padrão (somente se tabela vazia)
+    try:
+        df_users = db.query_table("usuarios")
+        if df_users.empty:
+            admin_email = "admin@i2a2.academy"
+            admin_pass = "admin123"
+            admin_hash = sha256_text(admin_pass)
+            db.inserir_usuario(
+                nome="Admin Padrão",
+                email=admin_email,
+                perfil="admin",
+                senha_hash=admin_hash,
+            )
+            # marca para exibir toast apenas uma vez fora do cache
+            st.session_state.admin_just_created = True
+    except Exception as e:
+        # Evita quebrar a app no primeiro run
+        print(f"[WARN] Não foi possível checar/criar admin padrão: {e}")
+
     chave_criptografia = carregar_chave_do_env("APP_SECRET_KEY")
     cofre = Cofre(key=chave_criptografia)
-    st.session_state.app_cofre = cofre # Armazena no estado da sessão para acesso fácil
-    
-    # --- CORREÇÃO: Chamadas st.toast REMOVIDAS daqui ---
+    st.session_state.app_cofre = cofre
 
-    # Instancia o Validador, passando o Cofre e o caminho das regras
     validador = ValidadorFiscal(cofre=cofre, regras_path=REGRAS_FISCAIS_PATH)
-    
+
     return db, memoria, cofre, validador
 
+
 def configure_llm(provider, model, api_key):
-    """Tenta configurar o LLM e retorna a instância ou None."""
+    """Configura o LLM e retorna a instância (ou None)."""
     try:
         if not provider or not model:
             st.session_state.llm_status_message = "Selecione Provedor e Modelo LLM."
             return None
-        # Prioriza a chave da UI, senão tenta variável de ambiente
         key_to_use = api_key or os.getenv(f"{provider.upper()}_API_KEY")
         if not key_to_use:
-            st.session_state.llm_status_message = f"Chave API para {provider} não encontrada na UI ou variáveis de ambiente."
+            st.session_state.llm_status_message = f"Chave API para {provider} não encontrada."
             return None
-
         llm = make_llm(provider=provider, model=model, api_key=key_to_use)
         st.session_state.llm_status_message = f"LLM {provider}/{model} ATIVO."
-        print(f"LLM Configurado: {provider}/{model}") # Log no console
         return llm
     except Exception as e:
         st.session_state.llm_status_message = f"Erro ao configurar LLM: {e}"
-        print(f"Erro LLM: {e}") # Log no console
         return None
 
-# --- Funções Auxiliares da UI ---
 
+# ---------------------- Helpers de exibição (cripto) ----------------------
 def descriptografar_e_mascarar_df(df: pd.DataFrame, cofre: Cofre) -> pd.DataFrame:
     """Descriptografa e mascara colunas sensíveis de um DataFrame para exibição."""
-    if df.empty: # Não verifica mais o cofre aqui, deixa a função interna tratar
-        return df
-    
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
     df_display = df.copy()
-    
-    # Função segura para aplicar descriptografia e mascaramento
-    def decrypt_and_mask(encrypted_value):
-        if not encrypted_value or not isinstance(encrypted_value, str):
-            return encrypted_value # Retorna valores não-string (ex: None)
-        
-        decrypted = encrypted_value
+
+    def decrypt_and_mask(x):
+        if x is None or not isinstance(x, str):
+            return x
+        decrypted = x
         if cofre.available:
             try:
-                decrypted = cofre.decrypt_text(encrypted_value)
-            except Exception as e:
-                print(f"Erro em decrypt_and_mask (decrypt): {e}")
+                decrypted = cofre.decrypt_text(x)
+            except Exception:
                 return "Erro Cripto"
-        
-        # Se a descriptografia falhou (retornou o original cripto) ou não estava ativa,
-        # ainda tentamos mascarar o que tivermos.
         return mascarar_documento_fiscal(decrypted)
 
-
-    if 'emitente_cnpj' in df_display.columns:
-        df_display['emitente_cnpj'] = df_display['emitente_cnpj'].apply(decrypt_and_mask)
-    if 'destinatario_cnpj' in df_display.columns:
-        df_display['destinatario_cnpj'] = df_display['destinatario_cnpj'].apply(decrypt_and_mask)
-    
+    for col in ("emitente_cnpj", "destinatario_cnpj"):
+        if col in df_display.columns:
+            df_display[col] = df_display[col].apply(decrypt_and_mask)
     return df_display
+
 
 def descriptografar_dict_para_edicao(data: dict, cofre: Cofre) -> dict:
     """Descriptografa dados de um dicionário para edição (sem máscara)."""
-    data_decrypted = data.copy()
+    data = dict(data or {})
     if not cofre.available:
-        return data_decrypted
-        
-    # Lista de campos que podem conter CNPJ ou CPF
-    campos_sensíveis = ['emitente_cnpj', 'destinatario_cnpj'] # Adicionar 'emitente_cpf', 'destinatario_cpf' se existirem
-    
-    for campo in campos_sensíveis:
-        valor_criptografado = data_decrypted.get(campo)
-        if valor_criptografado and isinstance(valor_criptografado, str):
+        return data
+    for campo in ("emitente_cnpj", "destinatario_cnpj"):
+        v = data.get(campo)
+        if isinstance(v, str) and v:
             try:
-                # Tenta descriptografar
-                data_decrypted[campo] = cofre.decrypt_text(valor_criptografado)
-            except Exception as e:
-                # Se falhar (ex: chave errada ou dado corrompido), mantém o valor criptografado para o usuário ver
-                print(f"Erro ao descriptografar {campo} para edição: {e}")
-                data_decrypted[campo] = f"ERRO_CRIPTOGRAFIA: {valor_criptografado}"
-    return data_decrypted
+                data[campo] = cofre.decrypt_text(v)
+            except Exception:
+                data[campo] = f"ERRO_CRIPTOGRAFIA: {v}"
+    return data
 
-# --- Interface Principal ---
 
+# ---------------------- Login ----------------------
+def attempt_login(db: BancoDeDados, email: str, senha: str) -> bool:
+    """Verifica credenciais (evita SQLi carregando e filtrando em memória)."""
+    if not email or not senha:
+        return False
+    try:
+        users = db.query_table("usuarios")
+        if users.empty:
+            return False
+        match = users[users["email"].str.lower() == email.lower()]
+        if match.empty:
+            return False
+        user = match.iloc[0].to_dict()
+        if sha256_text(senha) == user.get("senha_hash"):
+            st.session_state.logged_in = True
+            st.session_state.user_profile = user.get("perfil", "operador")
+            st.session_state.user_name = user.get("nome", "Usuário")
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Erro durante o login: {e}")
+        return False
+
+
+# ---------------------- UI: Cabeçalho / Sidebar / Abas ----------------------
 def ui_header():
     st.title("📄 Projeto Fiscal – Ingestão, OCR, XML, Validação & Análises")
     st.caption("I2A2 - PoC: processa XML/Imagens/PDFs, valida dados, permite revisão e análises com LLM.")
 
-def ui_sidebar(orch: Orchestrator):
-    st.sidebar.header("📤 Upload de Arquivos")
-    uploaded_files = st.sidebar.file_uploader(
-        "Selecione XML / PDF / Imagem", 
-        type=["xml", "pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp"],
-        accept_multiple_files=True # Permite múltiplos arquivos
-    )
-    origem = st.sidebar.text_input("Origem (rótulo livre)", value="upload_ui")
 
-    if uploaded_files:
-        if st.sidebar.button(f"Ingerir {len(uploaded_files)} Arquivo(s)"):
-            all_success = True
-            progress_bar = st.sidebar.progress(0, text="Iniciando ingestão...")
-            
+def ui_sidebar(orch: Orchestrator):
+    # Bloco do usuário (compatível com versões antigas)
+    with st.sidebar:
+        st.markdown(f"**👤 {st.session_state.user_name or 'Usuário'}**")
+        st.caption(f"Perfil: {st.session_state.user_profile or '—'}")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.user_profile = None
+            st.session_state.user_name = None
+            try:
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            st.rerun()
+
+        st.divider()
+        st.header("📤 Upload de Arquivos")
+        uploaded_files = st.file_uploader(
+            "Selecione XML / PDF / Imagem",
+            type=["xml", "pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp"],
+            accept_multiple_files=True,
+        )
+        origem = st.text_input("Origem (rótulo livre)", value="upload_ui")
+
+        if uploaded_files and st.button(f"Ingerir {len(uploaded_files)} Arquivo(s)", use_container_width=True):
+            all_ok = True
+            prog = st.progress(0, text="Iniciando ingestão...")
             for i, up in enumerate(uploaded_files):
-                status_text = f"Processando: {up.name} ({i+1}/{len(uploaded_files)})..."
-                progress_bar.progress((i + 1) / len(uploaded_files), text=status_text)
-                
+                prog.progress(
+                    (i + 1) / len(uploaded_files),
+                    text=f"Processando: {up.name} ({i+1}/{len(uploaded_files)})...",
+                )
                 try:
                     doc_id = orch.ingestir_arquivo(up.name, up.getvalue(), origem=origem)
                     doc_info = orch.db.get_documento(doc_id)
-                    status = doc_info.get('status') if doc_info else 'desconhecido'
-                    
-                    if status in ('revisao_pendente', 'erro', 'quarentena'):
-                        all_success = False
-                        st.sidebar.warning(f"ID {doc_id} ('{up.name}'): Status **{status}**")
+                    status = (doc_info or {}).get("status", "desconhecido")
+                    if status in ("revisao_pendente", "erro", "quarentena"):
+                        all_ok = False
+                        st.warning(f"ID {doc_id} ('{up.name}'): **{status}**")
                     else:
-                        st.sidebar.success(f"ID {doc_id} ('{up.name}'): Status **{status}**")
-                
+                        st.success(f"ID {doc_id} ('{up.name}'): **{status}**")
                 except Exception as e:
-                    all_success = False
-                    st.sidebar.error(f"Falha em '{up.name}': {e}")
-
-            progress_bar.empty()
-            if all_success:
-                st.sidebar.success("Todos os arquivos foram ingeridos com sucesso.")
+                    all_ok = False
+                    st.error(f"Falha em '{up.name}': {e}")
+            prog.empty()
+            if all_ok:
+                st.success("Todos os arquivos foram ingeridos com sucesso.")
             else:
-                 st.sidebar.warning("Alguns arquivos falharam ou precisam de revisão.")
-            st.rerun() # Recarrega a página para atualizar todas as abas
+                st.warning("Alguns arquivos falharam ou precisam de revisão.")
+            st.rerun()
 
-    st.sidebar.divider()
-    st.sidebar.header("🧠 Configuração LLM")
-    st.sidebar.caption(f"Status Atual: {st.session_state.llm_status_message}")
+        st.divider()
+        with st.expander("🧠 Configuração LLM", expanded=False):
+            st.caption(f"Status: {st.session_state.llm_status_message}")
+            providers = ["", "gemini", "openai", "openrouter"]
+            prov = st.selectbox("Provedor LLM", providers, index=0, key="llm_provider")
+            models: list[str] = []
+            if prov == "gemini":
+                models = GEMINI_MODELS
+            elif prov == "openai":
+                models = OPENAI_MODELS
+            elif prov == "openrouter":
+                models = OPENROUTER_MODELS
+            model = st.selectbox("Modelo", models, index=0 if models else -1, key="llm_model")
+            key = st.text_input("Chave API (opcional; usa env se vazio)", type="password", key="llm_api_key")
+            if st.button("Aplicar Configuração LLM", use_container_width=True):
+                st.session_state.llm_instance = configure_llm(prov, model, key)
+                try:
+                    st.cache_resource.clear()
+                except Exception:
+                    pass
+                st.rerun()
 
-    providers = ["", "gemini", "openai", "openrouter"]
-    selected_provider = st.sidebar.selectbox("Provedor LLM", options=providers, index=0, key="llm_provider")
 
-    models: list[str] = []
-    if selected_provider == "gemini": models = GEMINI_MODELS
-    elif selected_provider == "openai": models = OPENAI_MODELS
-    elif selected_provider == "openrouter": models = OPENROUTER_MODELS
+def ui_tabs(orch: Orchestrator, db: BancoDeDados, cofre: Cofre, user_profile: str):
+    # Monta lista de abas conforme perfil
+    tab_names = ["📚 Documentos", "🧾 Itens & Impostos", "🤖 Perguntas (LLM)"]
+    if user_profile in ("admin", "conferente"):
+        tab_names.append("🧐 Revisão Pendente")
+    if user_profile == "admin":
+        tab_names.extend(["📊 Métricas", "⚙️ Administração"])
+    tab_names.extend(["📝 Logs", "🧠 Memória LLM"])
 
-    selected_model = st.sidebar.selectbox("Modelo", options=models, index=0 if models else -1, key="llm_model")
-    api_key_input = st.sidebar.text_input("Chave API (opcional, usa var. ambiente se vazio)", type="password", key="llm_api_key")
+    tabs = st.tabs(tab_names)
+    tab_map = {name: tab for name, tab in zip(tab_names, tabs)}
 
-    if st.sidebar.button("Aplicar Configuração LLM"):
-        st.session_state.llm_instance = configure_llm(selected_provider, selected_model, api_key_input)
-        st.cache_resource.clear() # Limpa o cache para recriar o Orchestrator com o novo LLM
-        st.rerun()
-
-def ui_tabs(orch: Orchestrator, db: BancoDeDados, cofre: Cofre):
-    tab_list = [
-        "📚 Documentos",       # Tela 1 (com mascaramento)
-        "🧐 Revisão Pendente", # Tela 5 (implementada)
-        "🧾 Itens & Impostos", # Consulta
-        "🤖 Perguntas (LLM)",  # Tela 3 (com filtros)
-        "📊 Métricas",       # Tela 4 (implementada)
-        "⚙️ Administração",    # Tela 7 (implementada)
-        "📝 Logs",
-        "🧠 Memória LLM",
-    ]
-    tabs = st.tabs(tab_list)
-
-    # --- TELA 1: Documentos (com Mascaramento) ---
-    with tabs[0]:
+    # ----- Documentos -----
+    with tab_map["📚 Documentos"]:
         st.subheader("Documentos Processados")
-        status_filter_options = ["Todos", "processado", "revisado", "revisao_pendente", "quarentena", "erro"]
-        selected_status = st.selectbox("Filtrar por Status:", status_filter_options, key="doc_status_filter")
-
-        where_clause = ""
-        if selected_status != "Todos":
-            where_clause = f"status = '{selected_status}'"
-
+        status_opts = ["Todos", "processado", "revisado", "revisao_pendente", "quarentena", "erro"]
+        status_sel = st.selectbox("Filtrar por Status:", status_opts, key="doc_status_filter")
+        where = f"status = '{status_sel}'" if status_sel != "Todos" else None
         try:
-            df_docs = db.query_table("documentos", where=where_clause or None)
-            
-            # --- Aplica Descriptografia e Mascaramento ---
+            df_docs = db.query_table("documentos", where=where)
             df_display = descriptografar_e_mascarar_df(df_docs, cofre)
-            # ---------------------------------------------
-            
             st.dataframe(df_display, use_container_width=True, height=420)
-            
         except Exception as e:
             st.error(f"Erro na consulta de documentos: {e}")
             st.exception(e)
 
         st.markdown("---")
         st.subheader("Ações")
-        col1, col2, col3 = st.columns([1,1,2])
+        col1, col2, col3 = st.columns([1, 1, 2])
         with col1:
-            doc_id_acao = st.number_input("ID do Documento para Ações:", min_value=0, step=1, key="doc_id_acao_geral")
+            doc_id_acao = st.number_input("ID do Documento:", min_value=0, step=1, key="doc_id_acao_geral")
         with col2:
-            st.write("") # Espaçador
-            st.write("") # Espaçador
-            if st.button("🔁 Revalidar Documento", key="btn_revalidar_geral", disabled=(doc_id_acao == 0)):
+            st.write("")
+            st.write("")
+            # botão de tamanho natural (não esticado)
+            if st.button("🔁 Revalidar", disabled=(doc_id_acao == 0), use_container_width=False):
                 with st.spinner(f"Revalidando ID {doc_id_acao}..."):
                     out = orch.revalidar_documento(int(doc_id_acao))
                     if out.get("ok"):
@@ -259,509 +293,596 @@ def ui_tabs(orch: Orchestrator, db: BancoDeDados, cofre: Cofre):
                     else:
                         st.warning(out.get("mensagem"))
         with col3:
-            st.caption("Selecione um ID da tabela acima e clique em 'Revalidar' para reprocessar as regras de validação.")
+            st.caption("Selecione um ID na tabela e clique em 'Revalidar'.")
 
-    # --- TELA 5: Revisão Pendente (Implementada) ---
-    with tabs[1]:
-        st.subheader("Documentos Pendentes de Revisão (Tela 5)")
-        try:
-            # Filtros da Tela de Revisão
-            col_f1, col_f2, col_f3 = st.columns(3)
-            with col_f1: tipo_filtro = st.selectbox("Filtrar Tipo:", ["Todos", "NFe", "NFCe", "CTe", "pdf", "jpg", "png"], key="rev_tipo")
-            with col_f2: uf_filtro = st.text_input("Filtrar UF (ex: SP):", key="rev_uf")
-            # Status é implicitamente "revisao_pendente" nesta aba
-            
-            where_rev = "status = 'revisao_pendente'"
-            if tipo_filtro != "Todos": where_rev += f" AND tipo = '{tipo_filtro}'"
-            if uf_filtro: where_rev += f" AND uf = '{uf_filtro.upper()}'"
+    # ----- Revisão Pendente -----
+    if "🧐 Revisão Pendente" in tab_map:
+        with tab_map["🧐 Revisão Pendente"]:
+            st.subheader("Documentos Pendentes de Revisão")
+            try:
+                c1, c2, _ = st.columns([1, 1, 2])
+                with c1:
+                    tipo = st.selectbox("Filtrar Tipo:", ["Todos", "NFe", "NFCe", "CTe", "pdf", "jpg", "png"], key="rev_tipo")
+                with c2:
+                    uf = st.text_input("Filtrar UF (ex: SP):", key="rev_uf")
+                where_rev = "status = 'revisao_pendente'"
+                if tipo != "Todos":
+                    where_rev += f" AND tipo = '{tipo}'"
+                if uf:
+                    where_rev += f" AND uf = '{uf.upper()}'"
+                pend = db.query_table("documentos", where=where_rev)
 
-            df_pendentes = db.query_table("documentos", where=where_rev)
-            
-            if df_pendentes.empty:
-                st.info("🎉 Nenhum documento pendente de revisão com os filtros atuais.")
-            else:
-                # Exibe lista com mascaramento
-                df_pendentes_display = descriptografar_e_mascarar_df(df_pendentes, cofre)
-                st.dataframe(df_pendentes_display, use_container_width=True, height=250)
-
-                doc_ids_pendentes = df_pendentes['id'].tolist()
-                st.session_state.doc_id_revisao = st.selectbox(
-                    "Selecione o ID do Documento para Revisar:",
-                    options=[0] + doc_ids_pendentes, # Adiciona 0 como "Nenhum"
-                    index=0,
-                    key="select_doc_revisao"
-                )
-
-                if st.session_state.doc_id_revisao > 0:
-                    doc_id_rev = int(st.session_state.doc_id_revisao)
-                    st.markdown(f"--- \n#### 📝 Editando Documento ID: {doc_id_rev}")
-
-                    doc_data = db.get_documento(doc_id_rev)
-                    items_data = db.query_table("itens", where=f"documento_id = {doc_id_rev}")
-                    # TODO: Carregar impostos se a edição for necessária
-
-                    if not doc_data:
-                        st.error("Documento não encontrado (pode ter sido processado).")
-                    else:
-                        # --- Descriptografa para Edição (SEM MÁSCARA) ---
-                        doc_data_decrypted = descriptografar_dict_para_edicao(doc_data, cofre)
-                        editable_doc_fields = {k: v for k, v in doc_data_decrypted.items() if k not in ['id', 'hash', 'caminho_arquivo', 'data_upload']}
-                        
-                        # Abas de Edição
-                        rev_tab1, rev_tab2, rev_tab3 = st.tabs(["Cabeçalho", "Itens do Documento", "Recomendações (LLM)"])
-
-                        with rev_tab1:
-                            st.markdown("**Dados do Cabeçalho:**")
-                            st.session_state.edited_doc_data = st.data_editor(
-                                pd.DataFrame([editable_doc_fields]),
-                                use_container_width=True,
-                                num_rows="fixed", # Impede adicionar novas linhas
-                                key=f"editor_doc_{doc_id_rev}"
-                            )
-                        with rev_tab2:
-                            st.markdown("**Itens do Documento:**")
-                            item_cols_to_edit = ['descricao', 'ncm', 'cfop', 'quantidade', 'unidade', 'valor_unitario', 'valor_total', 'codigo_produto']
-                            # Garante que colunas existam mesmo se 'items_data' estiver vazio
-                            if items_data.empty:
-                                items_data_display = pd.DataFrame(columns=item_cols_to_edit)
-                            else:
-                                # Garante que apenas colunas existentes sejam selecionadas
-                                cols_existentes = [col for col in item_cols_to_edit if col in items_data.columns]
-                                items_data_display = items_data[cols_existentes]
-
-                            st.session_state.edited_items_data = st.data_editor(
-                                items_data_display,
-                                use_container_width=True,
-                                num_rows="dynamic", # Permite adicionar/remover/editar
-                                key=f"editor_items_{doc_id_rev}"
-                            )
-                        with rev_tab3:
-                            st.info("💡 Sugestões automáticas do Agente (LLM)")
-                            if st.button("Gerar Sugestões de Correção (LLM)"):
-                                if orch.analitico and st.session_state.llm_instance:
-                                    with st.spinner("Analisando inconsistências..."):
-                                        # Monta o prompt para sugestão
-                                        prompt_sugestao = f"O documento ID {doc_id_rev} está em revisão (motivo: {doc_data.get('motivo_rejeicao')}). Analise os dados do cabeçalho {doc_data_decrypted} e itens {items_data.to_dict('records')} e sugira correções fiscais (ex: CFOP, NCM, UF) ou de OCR."
-                                        # Chama o orquestrador (modo padrão, com geração de código)
-                                        sugestao_out = orch.responder_pergunta(prompt_sugestao, scope_filters={}, safe_mode=False)
-                                        st.markdown(sugestao_out.get("texto", "Não foi possível gerar sugestões."))
-                                else:
-                                    st.warning("O LLM não está configurado na sidebar.")
-
-                        st.markdown("---")
-                        col_r1, col_r2, col_r3 = st.columns(3)
-                        
-                        # Botão Salvar (Código Completo Restaurado)
-                        if col_r1.button("💾 Salvar Correções e Marcar como Revisado", key=f"save_rev_{doc_id_rev}", type="primary"):
-                            try:
-                                # --- Salvar Cabeçalho ---
-                                if not st.session_state.edited_doc_data.empty:
-                                    updated_doc_fields = st.session_state.edited_doc_data.iloc[0].to_dict()
-                                    
-                                    # --- CRIPTOGRAFAR NOVAMENTE ANTES DE SALVAR ---
-                                    campos_sensíveis = ['emitente_cnpj', 'destinatario_cnpj'] # Adicionar cpf se houver
-                                    for campo in campos_sensíveis:
-                                        if campo in updated_doc_fields and updated_doc_fields[campo]:
-                                            # Apenas criptografa se o cofre estiver ativo
-                                            if cofre.available:
-                                                updated_doc_fields[campo] = cofre.encrypt_text(str(updated_doc_fields[campo]))
-                                    # -----------------------------------------
-
-                                    # Registrar alterações na tabela 'revisoes'
-                                    for key, new_value in updated_doc_fields.items():
-                                        old_value = doc_data.get(key) # Valor (potencialmente cripto) do DB
-                                        if str(old_value) != str(new_value):
-                                            db.inserir_revisao(
-                                                documento_id=doc_id_rev, campo=f"documento.{key}",
-                                                valor_anterior=str(old_value), valor_corrigido=str(new_value),
-                                                usuario="revisor_ui" # TODO: Trocar por usuário logado
+                if pend.empty:
+                    st.info("🎉 Nenhum documento pendente de revisão com os filtros atuais.")
+                else:
+                    st.dataframe(descriptografar_e_mascarar_df(pend, cofre), use_container_width=True, height=250)
+                    ids = pend["id"].tolist()
+                    st.session_state.doc_id_revisao = st.selectbox(
+                        "Selecione o Documento:",
+                        options=[0] + ids,
+                        index=0,
+                        key="select_doc_revisao",
+                    )
+                    if st.session_state.doc_id_revisao > 0:
+                        doc_id = int(st.session_state.doc_id_revisao)
+                        st.markdown(f"--- \n#### 📝 Editando Documento ID: {doc_id}")
+                        doc = db.get_documento(doc_id)
+                        itens = db.query_table("itens", where=f"documento_id = {doc_id}")
+                        if not doc:
+                            st.error("Documento não encontrado.")
+                        else:
+                            doc_edit = {
+                                k: v
+                                for k, v in descriptografar_dict_para_edicao(doc, cofre).items()
+                                if k not in ("id", "hash", "caminho_arquivo", "data_upload")
+                            }
+                            t1, t2, t3 = st.tabs(["Cabeçalho", "Itens do Documento", "Recomendações (LLM)"])
+                            with t1:
+                                st.session_state.edited_doc_data = st.data_editor(
+                                    pd.DataFrame([doc_edit]),
+                                    use_container_width=True,
+                                    num_rows="fixed",
+                                    key=f"editor_doc_{doc_id}",
+                                )
+                            with t2:
+                                cols = [
+                                    "descricao",
+                                    "ncm",
+                                    "cfop",
+                                    "quantidade",
+                                    "unidade",
+                                    "valor_unitario",
+                                    "valor_total",
+                                    "codigo_produto",
+                                ]
+                                itens_disp = (
+                                    pd.DataFrame(columns=cols)
+                                    if itens.empty
+                                    else itens[[c for c in cols if c in itens.columns]]
+                                )
+                                st.session_state.edited_items_data = st.data_editor(
+                                    itens_disp, use_container_width=True, num_rows="dynamic", key=f"editor_items_{doc_id}"
+                                )
+                            with t3:
+                                st.info("💡 Sugestões automáticas do Agente (LLM).")
+                                if st.button("Gerar Sugestões de Correção (LLM)", use_container_width=False):
+                                    if orch.analitico and st.session_state.llm_instance:
+                                        with st.spinner("Analisando inconsistências..."):
+                                            prompt = (
+                                                f"O documento ID {doc_id} está em revisão (motivo: {doc.get('motivo_rejeicao')}). "
+                                                f"Analise os dados do cabeçalho {doc_edit} e itens {itens.to_dict('records')} "
+                                                f"e sugira correções fiscais (ex: CFOP, NCM, UF) ou de OCR."
                                             )
-                                    # Atualizar no banco
-                                    db.atualizar_documento_campos(doc_id_rev, **updated_doc_fields)
-
-                                # --- Salvar Itens ---
-                                # Lógica de deletar e reinserir (simplificada)
-                                # Primeiro, pega os IDs dos itens antigos para deletar impostos
-                                old_item_ids = tuple(items_data['id'].unique().tolist())
-                                
-                                # Deleta itens antigos
-                                db.conn.execute("DELETE FROM itens WHERE documento_id = ?", (doc_id_rev,))
-                                
-                                # Deleta impostos associados aos itens antigos (se houver)
-                                if old_item_ids:
-                                    id_placeholder = ', '.join('?' for _ in old_item_ids)
-                                    db.conn.execute(f"DELETE FROM impostos WHERE item_id IN ({id_placeholder})", old_item_ids)
-                                
-                                db.conn.commit()
-
-                                # Insere os itens editados
-                                for index, row in st.session_state.edited_items_data.iterrows():
-                                    item_dict = row.to_dict()
-                                    item_dict_clean = {k: v for k, v in item_dict.items() if pd.notna(v)}
-                                    if item_dict_clean: # Não insere linhas vazias
-                                        new_item_id = db.inserir_item(documento_id=doc_id_rev, **item_dict_clean)
-                                        # Registrar como revisão
-                                        db.inserir_revisao(
-                                            documento_id=doc_id_rev, campo=f"item[{index}]",
-                                            valor_anterior="(item recriado)", valor_corrigido=str(item_dict_clean),
-                                            usuario="revisor_ui"
-                                        )
-                                        # TODO: Adicionar lógica para salvar impostos associados se editados
-
-                                # --- Atualizar Status ---
-                                db.atualizar_documento_campo(doc_id_rev, "status", "revisado")
-                                db.atualizar_documento_campo(doc_id_rev, "motivo_rejeicao", "Corrigido manually") # Atualiza motivo
-                                db.log("revisao_concluida", "revisor_ui", f"doc_id={doc_id_rev} marcado como revisado.")
-                                st.success(f"Documento ID {doc_id_rev} atualizado e marcado como 'revisado'.")
-                                st.session_state.doc_id_revisao = 0; st.rerun()
-
-                            except Exception as e_save:
-                                st.error(f"Erro ao salvar revisões: {e_save}"); st.exception(e_save)
-                        
-                        if col_r2.button("✅ Aprovar (Marcar como Processado)", key=f"approve_{doc_id_rev}"):
-                             db.atualizar_documento_campo(doc_id_rev, "status", "processado")
-                             db.atualizar_documento_campo(doc_id_rev, "motivo_rejeicao", "Aprovado manualmente")
-                             db.log("revisao_aprovada", "revisor_ui", f"doc_id={doc_id_rev} marcado como processado.")
-                             st.success(f"Documento ID {doc_id_rev} marcado como 'processado'.")
-                             st.session_state.doc_id_revisao = 0; st.rerun()
-
-                        # --- Botão Reprocessar (Tela 5) ---
-                        if col_r3.button("🔁 Reprocessar (Re-Extrair)", key=f"reprocess_{doc_id_rev}", help="Apaga dados extraídos e re-executa o pipeline de ingestão."):
-                            with st.spinner(f"Reprocessando documento ID {doc_id_rev}..."):
-                                try:
-                                    # --- CORREÇÃO APLICADA: Chama a função reprocessar ---
-                                    out = orch.reprocessar_documento(int(doc_id_rev))
-                                    if out.get("ok"):
-                                        st.success(out.get("mensagem"))
+                                            out = orch.responder_pergunta(prompt, scope_filters={}, safe_mode=False)
+                                            st.markdown(out.get("texto", "Não foi possível gerar sugestões."))
                                     else:
-                                        st.error(out.get("mensagem"))
+                                        st.warning("O LLM não está configurado na sidebar.")
+
+                            st.markdown("---")
+                            c1, c2, c3 = st.columns(3)
+                            if c1.button("💾 Salvar & Revisar", use_container_width=False, type="primary"):
+                                try:
+                                    if not st.session_state.edited_doc_data.empty:
+                                        new_fields = st.session_state.edited_doc_data.iloc[0].to_dict()
+                                        for campo in ("emitente_cnpj", "destinatario_cnpj"):
+                                            if new_fields.get(campo) and st.session_state.app_cofre.available:
+                                                new_fields[campo] = st.session_state.app_cofre.encrypt_text(
+                                                    str(new_fields[campo])
+                                                )
+                                        for k, v in new_fields.items():
+                                            old = doc.get(k)
+                                            if str(old) != str(v):
+                                                db.inserir_revisao(
+                                                    documento_id=doc_id,
+                                                    campo=f"documento.{k}",
+                                                    valor_anterior=str(old),
+                                                    valor_corrigido=str(v),
+                                                    usuario=st.session_state.user_name or "revisor_ui",
+                                                )
+                                        db.atualizar_documento_campos(doc_id, **new_fields)
+
+                                    old_item_ids = tuple(itens["id"].unique().tolist()) if not itens.empty else ()
+                                    db.conn.execute("DELETE FROM itens WHERE documento_id = ?", (doc_id,))
+                                    if old_item_ids:
+                                        placeholders = ", ".join("?" for _ in old_item_ids)
+                                        db.conn.execute(
+                                            f"DELETE FROM impostos WHERE item_id IN ({placeholders})", old_item_ids
+                                        )
+                                    db.conn.commit()
+
+                                    for idx, row in st.session_state.edited_items_data.iterrows():
+                                        rowd = {k: v for k, v in row.to_dict().items() if pd.notna(v)}
+                                        if rowd:
+                                            new_item_id = db.inserir_item(documento_id=doc_id, **rowd)
+                                            db.inserir_revisao(
+                                                documento_id=doc_id,
+                                                campo=f"item[{idx}]",
+                                                valor_anterior="(item recriado)",
+                                                valor_corrigido=str(rowd),
+                                                usuario=st.session_state.user_name or "revisor_ui",
+                                            )
+                                    db.atualizar_documento_campo(doc_id, "status", "revisado")
+                                    db.atualizar_documento_campo(doc_id, "motivo_rejeicao", "Corrigido manualmente")
+                                    db.log(
+                                        "revisao_concluida",
+                                        st.session_state.user_name or "revisor_ui",
+                                        f"doc_id={doc_id} marcado como revisado.",
+                                    )
+                                    st.success(f"Documento ID {doc_id} atualizado e marcado como 'revisado'.")
                                     st.session_state.doc_id_revisao = 0
                                     st.rerun()
-                                except Exception as e_reproc:
-                                    st.error(f"Falha ao acionar reprocessamento: {e_reproc}")
-                                    st.exception(e_reproc)
+                                except Exception as e:
+                                    st.error(f"Erro ao salvar revisões: {e}")
+                                    st.exception(e)
 
-        except Exception as e:
-            st.error(f"Erro ao carregar documentos pendentes: {e}"); st.exception(e)
+                            if c2.button("✅ Aprovar (Processado)", use_container_width=False):
+                                db.atualizar_documento_campo(doc_id, "status", "processado")
+                                db.atualizar_documento_campo(doc_id, "motivo_rejeicao", "Aprovado manualmente")
+                                db.log(
+                                    "revisao_aprovada",
+                                    st.session_state.user_name or "revisor_ui",
+                                    f"doc_id={doc_id} marcado como processado.",
+                                )
+                                st.success(f"Documento ID {doc_id} marcado como 'processado'.")
+                                st.session_state.doc_id_revisao = 0
+                                st.rerun()
 
-    # --- TELA 2: Itens & Impostos ---
-    with tabs[2]:
+                            if c3.button("🔁 Reprocessar", help="Re-extrai os dados do arquivo.", use_container_width=False):
+                                with st.spinner(f"Reprocessando documento ID {doc_id}..."):
+                                    try:
+                                        out = orch.reprocessar_documento(doc_id)
+                                        if out.get("ok"):
+                                            st.success(out.get("mensagem"))
+                                        else:
+                                            st.error(out.get("mensagem"))
+                                        st.session_state.doc_id_revisao = 0
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Falha ao acionar reprocessamento: {e}")
+                                        st.exception(e)
+            except Exception as e:
+                st.error(f"Erro ao carregar documentos pendentes: {e}")
+                st.exception(e)
+
+    # ----- Itens & Impostos -----
+    with tab_map["🧾 Itens & Impostos"]:
         st.subheader("Consultar Itens & Impostos por Documento")
-        doc_id_q_itens = st.number_input("Documento ID:", min_value=0, step=1, key="doc_id_q_itens")
-        colA, colB = st.columns(2)
-
-        if st.button("Consultar Detalhes", key="btn_consultar_itens", disabled=(doc_id_q_itens == 0)):
+        doc_q = st.number_input("Documento ID:", min_value=0, step=1, key="doc_id_q_itens")
+        # Botão compacto centralizado
+        c_left, c_btn, c_right = st.columns([4, 1, 4])
+        with c_btn:
+            consultar = st.button("Consultar", disabled=(doc_q == 0), type="primary", use_container_width=True)
+        cA, cB = st.columns(2)
+        if consultar:
             try:
-                doc_header = db.get_documento(int(doc_id_q_itens))
-                if doc_header:
-                    st.write(f"**Detalhes para Documento ID: {doc_id_q_itens} (Status: {doc_header.get('status')})**")
-                    itens = db.query_table("itens", where=f"documento_id = {int(doc_id_q_itens)}")
+                header = db.get_documento(int(doc_q))
+                if header:
+                    st.write(f"**Detalhes para Documento ID: {doc_q} (Status: {header.get('status')})**")
+                    itens = db.query_table("itens", where=f"documento_id = {int(doc_q)}")
                     impostos = pd.DataFrame()
-                    with colA:
+                    with cA:
                         st.markdown("**Itens**")
                         if not itens.empty:
                             st.dataframe(itens, use_container_width=True, height=360)
-                            item_ids = tuple(itens["id"].unique().tolist())
-                            item_ids_sql = ', '.join(map(str, item_ids))
-                            impostos = db.query_table("impostos", where=f"item_id IN ({item_ids_sql})")
-                        else: st.info("Nenhum item encontrado.")
-                    with colB:
+                            ids = tuple(itens["id"].unique().tolist())
+                            if ids:
+                                ids_sql = ", ".join(map(str, ids))
+                                impostos = db.query_table("impostos", where=f"item_id IN ({ids_sql})")
+                        else:
+                            st.info("Nenhum item encontrado.")
+                    with cB:
                         st.markdown("**Impostos**")
                         if not impostos.empty:
                             st.dataframe(impostos, use_container_width=True, height=360)
                         elif not itens.empty:
-                             st.info("Nenhum imposto associado aos itens deste documento.")
+                            st.info("Nenhum imposto associado aos itens.")
                         else:
-                             st.info("Consulte os itens primeiro.")
-                else: st.warning(f"Documento com ID {doc_id_q_itens} não encontrado.")
-            except Exception as e: st.error(f"Erro ao consultar: {e}"); st.exception(e)
+                            st.info("Consulte os itens primeiro.")
+                else:
+                    st.warning(f"Documento com ID {doc_q} não encontrado.")
+            except Exception as e:
+                st.error(f"Erro ao consultar: {e}")
+                st.exception(e)
 
-    # --- TELA 3: Perguntas (LLM) (com Filtros e Toggles) ---
-    with tabs[3]:
-        st.subheader("Perguntas Analíticas (LLM → Sandbox) (Tela 3)")
-        
-        # Filtros de Escopo
+    # ----- Perguntas (LLM) -----
+    with tab_map["🤖 Perguntas (LLM)"]:
+        st.subheader("Perguntas Analíticas (LLM → Sandbox)")
         st.markdown("**Filtros de Escopo (Opcional):**")
-        col_f_llm1, col_f_llm2 = st.columns(2)
-        with col_f_llm1:
-            uf_escopo = st.text_input("Filtrar por UF (ex: SP, RJ):", key="llm_scope_uf")
-        with col_f_llm2:
-            tipo_escopo = st.multiselect("Filtrar por Tipo:", ["NFe", "NFCe", "CTe", "pdf", "png", "jpg"], key="llm_scope_tipo")
-
-        # Toggles de Controle
-        col_t_llm1, col_t_llm2 = st.columns(2)
-        with col_t_llm1:
-            safe_mode = st.toggle("Modo Seguro (sem geração de código)", value=False, key="llm_safe_mode", help="Força o uso de ferramentas pré-definidas (se implementadas). Desabilita a geração de código Python.")
-        with col_t_llm2:
+        f1, f2 = st.columns(2)
+        with f1:
+            uf_scope = st.text_input("Filtrar por UF (ex: SP, RJ):", key="llm_scope_uf")
+        with f2:
+            tipo_scope = st.multiselect("Filtrar por Tipo:", ["NFe", "NFCe", "CTe", "pdf", "png", "jpg"], key="llm_scope_tipo")
+        t1, t2 = st.columns(2)
+        with t1:
+            safe_mode = st.toggle(
+                "Modo Seguro (sem IA)",
+                value=False,
+                key="llm_safe_mode",
+                help="Tenta responder usando lógica interna rápida (sem LLM).",
+            )
+        with t2:
             show_code = st.toggle("Mostrar Código Gerado", value=True, key="llm_show_code")
-        
         st.markdown("---")
 
-        if orch.analitico and st.session_state.llm_instance:
-            st.success(f"LLM Ativo: {st.session_state.llm_status_message}")
-            pergunta = st.text_area("Sua Pergunta:", height=100, placeholder="Ex: Qual o valor total por UF dos documentos processados?")
+        if (orch.analitico and st.session_state.llm_instance) or safe_mode:
+            if orch.analitico and st.session_state.llm_instance:
+                st.success(f"LLM Ativo: {st.session_state.llm_status_message}")
+            else:
+                st.info("LLM não configurado. Apenas o 'Modo Seguro' funcionará.")
 
-            if st.button("Executar Análise", key="btn_executar_llm", disabled=not pergunta.strip()):
+            pergunta = st.text_area(
+                "Sua Pergunta:",
+                height=100,
+                placeholder="Ex: Qual o valor total por UF dos documentos processados?",
+            )
+
+            # Barra de ações à direita
+            bar_left, bar_clear, bar_exec = st.columns([6, 2, 2])
+            with bar_clear:
+                limpar = st.button("Limpar", use_container_width=True, key="llm_clear")
+            with bar_exec:
+                executar = st.button(
+                    "Executar Análise", type="primary", use_container_width=True, key="btn_executar_llm", disabled=not pergunta.strip()
+                )
+
+            if limpar:
+                st.session_state["llm_scope_uf"] = ""
+                st.session_state["llm_scope_tipo"] = []
+                st.rerun()
+
+            if executar:
                 with st.spinner("O Agente Analítico está pensando..."):
                     try:
-                        # --- CORREÇÃO APLICADA: Passa filtros para o Orchestrator ---
-                        scope = {
-                            "uf": uf_escopo if uf_escopo else None,
-                            "tipo": tipo_escopo if tipo_escopo else None
-                        }
+                        scope = {"uf": uf_scope or None, "tipo": tipo_scope or None}
                         out = orch.responder_pergunta(pergunta, scope_filters=scope, safe_mode=safe_mode)
-                        # -----------------------------------------------------------
-                        
                         st.info(f"Análise concluída em {out.get('duracao_s', 0):.2f}s (Agente: {out.get('agent_name', 'N/A')})")
-                        st.markdown("**Resposta:**"); st.markdown(out.get("texto", "*Nenhum texto retornado.*"))
+                        st.markdown("**Resposta:**")
+                        st.markdown(out.get("texto", "*Nenhum texto retornado.*"))
 
                         tabela = out.get("tabela")
                         if isinstance(tabela, pd.DataFrame) and not tabela.empty:
-                            st.markdown("**Tabela de Dados:**"); st.dataframe(tabela, use_container_width=True, height=360)
+                            st.markdown("**Tabela de Dados:**")
+                            st.dataframe(tabela, use_container_width=True, height=360)
 
                         figs = out.get("figuras") or []
                         if figs:
                             st.markdown("**Gráfico(s):**")
-                            for i, f in enumerate(figs):
+                            for f in figs:
                                 try:
-                                    import plotly.graph_objects as go; import matplotlib.figure
-                                    if isinstance(f, go.Figure): st.plotly_chart(f, use_container_width=True)
-                                    elif isinstance(f, matplotlib.figure.Figure): st.pyplot(f)
-                                    else: st.warning(f"Tipo de figura não suportado: {type(f)}")
-                                except ImportError: st.warning("Libs gráficas não instaladas.")
-                                except Exception as e_fig: st.error(f"Erro ao exibir figura: {e_fig}")
-
-                        if show_code: # Usa o toggle
-                            with st.expander("Ver Código Executado"):
+                                    import plotly.graph_objects as go
+                                    import matplotlib.figure
+                                    if isinstance(f, go.Figure):
+                                        st.plotly_chart(f, use_container_width=True)
+                                    elif isinstance(f, matplotlib.figure.Figure):
+                                        st.pyplot(f)
+                                    else:
+                                        st.warning(f"Tipo de figura não suportado: {type(f)}")
+                                except ImportError:
+                                    st.warning("Bibliotecas gráficas não instaladas.")
+                                except Exception as e:
+                                    st.error(f"Erro ao exibir figura: {e}")
+                        if show_code:
+                            with st.expander("Ver Código Executado (ou Query Rápida)"):
                                 st.code(out.get("code", "# Nenhum código disponível"), language="python")
-
                     except Exception as e:
-                        st.error(f"Falha ao responder: {e}"); st.code(traceback.format_exc(), language="python")
+                        st.error(f"Falha ao responder: {e}")
+                        st.code(traceback.format_exc(), language="python")
         else:
             st.warning(f"LLM não está ativo. Status: {st.session_state.llm_status_message}")
 
-    # --- TELA 6: Métricas (Implementada com dados reais) ---
-    with tabs[4]:
-        st.subheader("Métricas e Monitoramento (Tela 4)")
-        
-        df_metricas = pd.DataFrame() # Inicializa
-        try:
-            # --- CORREÇÃO APLICADA: Lê dados reais da tabela 'metricas' ---
-            df_metricas_raw = db.query_table("metricas")
+    # ----- Métricas -----
+    if "📊 Métricas" in tab_map:
+        with tab_map["📊 Métricas"]:
+            # Cabeçalho com ação à direita
+            title_col, act_col = st.columns([7, 3])
+            with title_col:
+                st.subheader("Métricas e Monitoramento")
+            with act_col:
+                gerar_insights = st.button("Gerar Insights", type="primary", use_container_width=True, key="btn_insights")
 
-            # Filtros
-            tipos_no_db = df_metricas_raw['tipo_documento'].unique().tolist() if not df_metricas_raw.empty else []
-            col_m1, col_m2, col_m3 = st.columns(3)
-            with col_m1: date_range = st.date_input("Período", (pd.Timestamp.now() - pd.DateOffset(days=30), pd.Timestamp.now()), key="metric_date")
-            with col_m2: doc_type = st.selectbox("Tipo de Documento", ["Todos"] + tipos_no_db, key="metric_doctype")
-            with col_m3: status_met = st.selectbox("Status", ["Todos", "processado", "erro", "revisao_pendente", "revisado", "quarentena"], key="metric_status")
-            
-            # TODO: Aplicar filtros ao df_metricas
-            df_metricas = df_metricas_raw.copy()
-            # (Lógica de filtro de data, tipo e status seria aplicada aqui)
-            
-            if df_metricas.empty:
-                st.info("Nenhuma métrica registrada no banco de dados (ou nos filtros selecionados).")
-            else:
-                # Calcula KPIs Reais
-                acuracia_media = df_metricas['acuracia_media'].mean() * 100
-                taxa_revisao = df_metricas['taxa_revisao'].mean() * 100
-                tempo_medio = df_metricas['tempo_medio'].mean()
-                total_docs = len(df_metricas)
-                taxa_erro = df_metricas['taxa_erro'].mean() * 100
+            try:
+                df_metricas_raw = db.query_table("metricas")
+                tipos = df_metricas_raw["tipo_documento"].unique().tolist() if not df_metricas_raw.empty else []
+                c1, c2 = st.columns(2)
+                with c1:
+                    date_range = st.date_input(
+                        "Período",
+                        (pd.Timestamp.now() - pd.DateOffset(days=30), pd.Timestamp.now()),
+                        key="metric_date",
+                    )
+                with c2:
+                    doc_type = st.selectbox("Tipo de Documento", ["Todos"] + tipos, key="metric_doctype")
+                df_metricas = df_metricas_raw.copy()
 
-                # KPIs (Cards)
-                col_k1, col_k2, col_k3, col_k4, col_k5 = st.columns(5)
-                col_k1.metric("Acurácia Média (Conf.)", f"{acuracia_media:.1f}%")
-                col_k2.metric("Taxa de Revisão", f"{taxa_revisao:.1f}%", help="Percentual de documentos que exigiram revisão humana.")
-                col_k3.metric("Tempo Médio Proc.", f"{tempo_medio:.2f}s")
-                col_k4.metric("Total de Eventos", f"{total_docs}", help="Total de eventos de processamento registrados.")
-                col_k5.metric("Taxa de Erro", f"{taxa_erro:.1f}%", help="% de eventos de processamento que resultaram em erro.")
+                if df_metricas.empty:
+                    st.info("Nenhuma métrica registrada no banco de dados (ou nos filtros selecionados).")
+                else:
+                    acur = df_metricas["acuracia_media"].mean() * 100
+                    tx_rev = df_metricas["taxa_revisao"].mean() * 100
+                    t_med = df_metricas["tempo_medio"].mean()
+                    total = len(df_metricas)
+                    tx_err = df_metricas["taxa_erro"].mean() * 100
+                    k1, k2, k3, k4, k5 = st.columns(5)
+                    k1.metric("Acurácia Média (Conf.)", f"{acur:.1f}%")
+                    k2.metric("Taxa de Revisão", f"{tx_rev:.1f}%")
+                    k3.metric("Tempo Médio Proc.", f"{t_med:.2f}s")
+                    k4.metric("Total de Eventos", f"{total}")
+                    k5.metric("Taxa de Erro", f"{tx_err:.1f}%")
+
+                    st.markdown("---")
+                    g1, g2 = st.columns(2)
+                    with g1:
+                        st.markdown("**Acurácia Média por Tipo**")
+                        st.bar_chart(df_metricas.groupby("tipo_documento")["acuracia_media"].mean())
+                    with g2:
+                        st.markdown("**Taxa de Erro por Tipo**")
+                        st.bar_chart(df_metricas.groupby("tipo_documento")["taxa_erro"].mean() * 100)
 
                 st.markdown("---")
-                
-                col_g1, col_g2 = st.columns(2)
-                with col_g1:
-                    st.markdown("**Acurácia (Confiança) Média por Tipo**")
-                    df_tipo_acuracia = df_metricas.groupby('tipo_documento')['acuracia_media'].mean()
-                    st.bar_chart(df_tipo_acuracia)
-                    
-                with col_g2:
-                    st.markdown("**Taxa de Erro por Tipo**")
-                    df_tipo_erro = df_metricas.groupby('tipo_documento')['taxa_erro'].mean() * 100
-                    st.bar_chart(df_tipo_erro)
-
-            st.markdown("---")
-            # --- IMPLEMENTAÇÃO: Insights Cognitivos (Tela 6) ---
-            st.subheader("Insights Cognitivos (LLM)")
-            if st.button("Gerar Insights Automáticos sobre Métricas"):
-                if orch.analitico and st.session_state.llm_instance:
-                    if df_metricas.empty:
-                        st.warning("Não há métricas para analisar.")
-                    else:
-                        with st.spinner("Analisando métricas..."):
-                            # Prepara os dados para o prompt
-                            kpis_principais = {
-                                "acuracia_media": acuracia_media, "taxa_revisao": taxa_revisao,
-                                "tempo_medio": tempo_medio, "taxa_erro": taxa_erro, "total_eventos": total_docs
-                            }
-                            # Converte dataframes em strings (ou JSON) para o prompt
-                            dados_tipo_acuracia = df_metricas.groupby('tipo_documento')['acuracia_media'].mean().to_json()
-                            dados_tipo_erro = df_metricas.groupby('tipo_documento')['taxa_erro'].mean().to_json()
-                            
-                            prompt_insights = f"""
-                            Analise os seguintes KPIs de um sistema de processamento de documentos:
-                            KPIs Principais: {kpis_principais}
-                            Acurácia (Confiança) por Tipo: {dados_tipo_acuracia}
-                            Taxa de Erro por Tipo: {dados_tipo_erro}
-                            
-                            Com base nesses dados, forneça 2 a 3 insights acionáveis em português. 
-                            Foque em:
-                            1. Qual tipo de documento está performando melhor ou pior (em acurácia e erro)?
-                            2. Qual é a relação entre a taxa de revisão e a acurácia?
-                            3. Há algum ponto crítico óbvio que a equipe de operações deveria investigar?
-                            
-                            Seja sucinto e direto ao ponto.
-                            """
-                            # Chama o orquestrador (modo padrão, sem filtros de escopo, sem modo seguro)
-                            insights_out = orch.responder_pergunta(prompt_insights, scope_filters={}, safe_mode=False)
-                            st.markdown(insights_out.get("texto", "Não foi possível gerar insights."))
+                st.subheader("Documentos com Baixa Confiança (< 70%)")
+                df_baixa = db.query_table("extracoes", where="confianca_media < 0.7")
+                if not df_baixa.empty:
+                    st.dataframe(df_baixa, use_container_width=True, height=200)
                 else:
-                    st.warning("O LLM não está configurado na sidebar. Ative-o para gerar insights.")
-            
-            st.markdown("---")
-            st.subheader("Documentos com Baixa Confiança (< 70%)")
-            # Esta tabela permanece, pois busca em 'extracoes'
-            df_baixa_conf = db.query_table("extracoes", where="confianca_media < 0.7")
-            if not df_baixa_conf.empty:
-                st.dataframe(df_baixa_conf, use_container_width=True, height=200)
-            else:
-                st.info("Nenhum documento com confiança inferior a 70% encontrado.")
-                
-        except Exception as e_metric:
-            st.error(f"Erro ao carregar métricas: {e_metric}")
-            st.exception(e_metric)
+                    st.info("Nenhum documento com confiança inferior a 70% encontrado.")
 
-    # --- TELA 7: Administração (Implementada) ---
-    with tabs[5]:
-        st.subheader("Administração e Segurança (Tela 7)")
-        
-        # NOTE: Esta é uma implementação de PoC sem autenticação real.
-        # Em produção, esta tela inteira deveria ser protegida por login.
-        
-        admin_tab1, admin_tab2 = st.tabs(["Gerenciar Usuários", "Criar Novo Usuário"])
-        
-        with admin_tab1:
-            st.markdown("**Usuários Cadastrados**")
-            try:
-                df_usuarios = db.query_table("usuarios")
-                # Não exibir o hash da senha
-                colunas_display = ['id', 'nome', 'email', 'perfil']
-                st.dataframe(df_usuarios[colunas_display], use_container_width=True)
-                
-                st.markdown("**Deletar Usuário**")
-                col_del1, col_del2 = st.columns([1, 3])
-                with col_del1:
-                    user_id_to_delete = st.number_input("ID do Usuário para Deletar:", min_value=1, step=1, key="user_delete_id")
-                with col_del2:
-                    st.write("") # Espaçador
-                    if st.button("Deletar Usuário", key=f"delete_user_{user_id_to_delete}", disabled=(user_id_to_delete==0)):
-                        try:
-                            # Adiciona um método simples de deleção ao DB (idealmente estaria em banco_de_dados.py)
-                            db.conn.execute("DELETE FROM usuarios WHERE id = ?", (user_id_to_delete,))
-                            db.conn.commit()
-                            st.success(f"Usuário ID {user_id_to_delete} deletado.")
-                            st.rerun()
-                        except Exception as e_del:
-                            st.error(f"Erro ao deletar usuário: {e_del}")
-
-            except Exception as e_admin_load:
-                st.error(f"Erro ao carregar usuários: {e_admin_load}")
-
-        with admin_tab2:
-            st.markdown("**Criar Novo Usuário**")
-            with st.form("form_novo_usuario"):
-                nome = st.text_input("Nome")
-                email = st.text_input("Email")
-                perfil = st.selectbox("Perfil", ["operador", "conferente", "admin"])
-                senha = st.text_input("Senha", type="password")
-                senha_confirma = st.text_input("Confirmar Senha", type="password")
-                
-                submitted = st.form_submit_button("Criar Usuário")
-                
-                if submitted:
-                    if not nome or not email or not perfil or not senha:
-                        st.warning("Todos os campos são obrigatórios.")
-                    elif senha != senha_confirma:
-                        st.error("As senhas não conferem.")
+                if gerar_insights:
+                    if orch.analitico and st.session_state.llm_instance:
+                        if df_metricas.empty:
+                            st.warning("Não há métricas para analisar.")
+                        else:
+                            with st.spinner("Gerando insights..."):
+                                kpis = {
+                                    "acuracia_media": acur,
+                                    "taxa_revisao": tx_rev,
+                                    "tempo_medio": t_med,
+                                    "taxa_erro": tx_err,
+                                    "total_eventos": total,
+                                }
+                                d1 = df_metricas.groupby("tipo_documento")["acuracia_media"].mean().to_json()
+                                d2 = df_metricas.groupby("tipo_documento")["taxa_erro"].mean().to_json()
+                                prompt = f"""
+                                Analise os seguintes KPIs:
+                                KPIs Principais: {kpis}
+                                Acurácia por Tipo: {d1}
+                                Taxa de Erro por Tipo: {d2}
+                                Forneça 2 a 3 insights acionáveis, em português, sucintos.
+                                """
+                                out = orch.responder_pergunta(prompt, scope_filters={}, safe_mode=False)
+                                st.markdown(out.get("texto", "Não foi possível gerar insights."))
                     else:
-                        try:
-                            # Hashing simples (SHA256) para a PoC (Não use em produção!)
-                            senha_hash = sha256_text(senha)
-                            # (Idealmente, inserir_usuario estaria em banco_de_dados.py)
-                            db.inserir_usuario(
-                                nome=nome,
-                                email=email,
-                                perfil=perfil,
-                                senha_hash=senha_hash
-                            )
-                            st.success(f"Usuário '{nome}' ({email}) criado com perfil '{perfil}'.")
-                            db.log("criacao_usuario", "admin_ui", f"Usuário {email} criado.")
-                        except Exception as e_create:
-                            st.error(f"Erro ao criar usuário: {e_create}")
+                        st.warning("O LLM não está configurado na sidebar.")
+            except Exception as e:
+                st.error(f"Erro ao carregar métricas: {e}")
+                st.exception(e)
 
-    # --- Logs ---
-    with tabs[6]:
+    # ----- Administração -----
+    if "⚙️ Administração" in tab_map:
+        with tab_map["⚙️ Administração"]:
+            st.subheader("Administração e Segurança")
+            a1, a2 = st.tabs(["Gerenciar Usuários", "Criar Novo Usuário"])
+            with a1:
+                try:
+                    df_users = db.query_table("usuarios")
+                    cols_disp = ["id", "nome", "email", "perfil"]
+                    cols_exist = [c for c in cols_disp if c in df_users.columns]
+                    if not df_users.empty:
+                        st.session_state.edited_users_data = st.data_editor(
+                            df_users[cols_exist],
+                            use_container_width=True,
+                            disabled=["id", "email"],
+                            column_config={
+                                "perfil": st.column_config.SelectboxColumn(
+                                    "Perfil", options=["operador", "conferente", "admin"], required=True
+                                )
+                            },
+                            key="editor_usuarios",
+                        )
+                        # Ação alinhada à direita
+                        ac_left, ac_right = st.columns([8, 2])
+                        with ac_right:
+                            salvar = st.button("Salvar alterações", type="primary", use_container_width=True)
+                        if salvar:
+                            orig = df_users[cols_exist].set_index("id")
+                            edit = st.session_state.edited_users_data.set_index("id")
+                            changes = 0
+                            for uid, row_new in edit.iterrows():
+                                if uid in orig.index and not orig.loc[uid].equals(row_new):
+                                    if uid == 1 and row_new.get("perfil") != "admin":
+                                        st.error("Não é permitido alterar o perfil do usuário ID 1 (admin padrão).")
+                                        continue
+                                    db.conn.execute(
+                                        "UPDATE usuarios SET nome = ?, perfil = ? WHERE id = ?",
+                                        (row_new.get("nome"), row_new.get("perfil"), int(uid)),
+                                    )
+                                    db.conn.commit()
+                                    db.log(
+                                        "update_usuario",
+                                        st.session_state.user_name or "admin_ui",
+                                        f"Usuário ID {uid} atualizado.",
+                                    )
+                                    changes += 1
+                            st.success(f"{changes} usuário(s) atualizado(s).") if changes else st.info("Nenhuma alteração.")
+                            if changes:
+                                st.rerun()
+                    else:
+                        st.info("Nenhum usuário cadastrado.")
+
+                    st.markdown("**Deletar Usuário**")
+                    c1, c2, c3 = st.columns([1, 2, 2])
+                    with c1:
+                        uid_del = st.number_input("ID do Usuário:", min_value=0, step=1, key="user_delete_id")
+                    with c2:
+                        confirmar = st.checkbox("Confirmo a exclusão", key="chk_confirma_delete")
+                    with c3:
+                        if st.button(
+                            "Deletar Usuário",
+                            disabled=(uid_del == 0 or not confirmar),
+                            use_container_width=True,
+                        ):
+                            if uid_del == 1:
+                                st.error("Não é permitido deletar o usuário ID 1 (admin padrão).")
+                            else:
+                                try:
+                                    db.conn.execute("DELETE FROM usuarios WHERE id = ?", (int(uid_del),))
+                                    db.conn.commit()
+                                    st.success(f"Usuário ID {int(uid_del)} deletado.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro ao deletar usuário: {e}")
+                except Exception as e:
+                    st.error(f"Erro ao carregar usuários: {e}")
+
+            with a2:
+                with st.form("form_novo_usuario"):
+                    nome = st.text_input("Nome")
+                    email = st.text_input("Email")
+                    perfil = st.selectbox("Perfil", ["operador", "conferente", "admin"])
+                    senha = st.text_input("Senha", type="password")
+                    senha_conf = st.text_input("Confirmar Senha", type="password")
+                    sub = st.form_submit_button("Criar Usuário")
+                    if sub:
+                        if not nome or not email or not perfil or not senha:
+                            st.warning("Todos os campos são obrigatórios.")
+                        elif senha != senha_conf:
+                            st.error("As senhas não conferem.")
+                        else:
+                            try:
+                                db.inserir_usuario(
+                                    nome=nome,
+                                    email=email,
+                                    perfil=perfil,
+                                    senha_hash=sha256_text(senha),
+                                )
+                                st.success(f"Usuário '{nome}' ({email}) criado com perfil '{perfil}'.")
+                                db.log(
+                                    "criacao_usuario",
+                                    st.session_state.user_name or "admin_ui",
+                                    f"Usuário {email} criado.",
+                                )
+                            except Exception as e:
+                                st.error(f"Erro ao criar usuário (email pode já existir): {e}")
+
+    # ----- Logs -----
+    with tab_map["📝 Logs"]:
         st.subheader("Logs do Sistema")
         try:
-            limit = st.number_input("Número de logs recentes para exibir:", min_value=10, max_value=1000, value=100, step=10, key="log_limit")
-            logs_df = db.query_table("logs")
-            st.dataframe(logs_df.sort_values("id", ascending=False).head(limit), use_container_width=True, height=420)
-        except Exception as e: st.error(f"Erro ao carregar logs: {e}")
+            limit = st.number_input(
+                "Número de logs recentes:", min_value=10, max_value=1000, value=100, step=10, key="log_limit"
+            )
+            logs = db.query_table("logs")
+            st.dataframe(logs.sort_values("id", ascending=False).head(limit), use_container_width=True, height=420)
+        except Exception as e:
+            st.error(f"Erro ao carregar logs: {e}")
 
-    # --- Memória LLM ---
-    with tabs[7]:
+    # ----- Memória LLM -----
+    with tab_map["🧠 Memória LLM"]:
         st.subheader("Histórico de Perguntas (Memória LLM)")
         try:
             mem = db.query_table("memoria")
             st.dataframe(mem.sort_values("id", ascending=False), use_container_width=True, height=420)
-        except Exception as e: st.error(f"Erro ao carregar memória: {e}")
+        except Exception as e:
+            st.error(f"Erro ao carregar memória: {e}")
 
 
-# --- Função Principal ---
+# ---------------------- MAIN ----------------------
 def main():
-    # Pega serviços básicos (DB, Memoria, Cofre, Validador) do cache
-    # Esta função agora cacheia todos os serviços essenciais e pré-configurados
+    # Serviços centrais
     db, memoria, cofre, validador = get_core_services()
 
-    # --- CORREÇÃO: Mover a lógica do st.toast para fora da função cacheada ---
-    if 'toast_exibido' not in st.session_state:
-        st.session_state.toast_exibido = False
-        
+    # Toasts (fora do cache)
+    if st.session_state.admin_just_created:
+        st.toast("Admin padrão (admin@i2a2.academy / admin123) foi criado!", icon="🎉")
+        st.session_state.admin_just_created = False
+
     if not st.session_state.toast_exibido:
         if not CRYPTO_OK:
             st.toast("Biblioteca 'cryptography' não encontrada. Criptografia desativada.", icon="⚠️")
-            st.session_state.toast_exibido = True # Exibe só uma vez
         elif not cofre.available:
-             st.toast("Chave APP_SECRET_KEY não definida. Criptografia desativada.", icon="⚠️")
-             st.session_state.toast_exibido = True # Exibe só uma vez
-    # -------------------------------------------------------------------------
+            st.toast("Chave APP_SECRET_KEY não definida. Criptografia desativada.", icon="⚠️")
+        st.session_state.toast_exibido = True
 
-    # O LLM é configurado dinamicamente via sidebar e armazenado no session_state
-    # Cria o orchestrator com o LLM do estado da sessão (pode ser None)
-    # E passa o cofre e o validador já instanciados
-    orch = Orchestrator(
-        db=db,
-        validador=validador,
-        memoria=memoria,
-        llm=st.session_state.llm_instance,
-        cofre=cofre # Passa o Cofre para o Orchestrator
-    )
-
-    # Renderiza UI
-    ui_header()
-    ui_sidebar(orch) # Passa o orchestrator atualizado para a sidebar
-    ui_tabs(orch, db, cofre) # Passa orchestrator, db, e cofre para as abas
+    # Gate de login
+    if not st.session_state.logged_in:
+        # Centraliza o título da página de login (HTML seguro)
+        st.markdown(
+            "<h1 style='text-align:center; margin-top: 12px;'>Agente Fiscal - Login</h1>",
+            unsafe_allow_html=True,
+        )
+        # Container central
+        c = st.columns([1, 1.5, 1])[1]
+        with c:
+            with st.container():
+                login_tab, register_tab = st.tabs(["Login", "Registrar"])
+                with login_tab:
+                    with st.form("login_form"):
+                        email = st.text_input("Email", placeholder="admin@i2a2.academy")
+                        senha = st.text_input("Senha", type="password", placeholder="••••••••")
+                        submitted = st.form_submit_button("Login")
+                        if submitted:
+                            if attempt_login(db, email, senha):
+                                st.success("Login bem-sucedido!")
+                                st.rerun()
+                            else:
+                                st.error("Email ou senha inválidos.")
+                with register_tab:
+                    with st.form("register_form"):
+                        st.markdown("Criar uma nova conta (perfil: **operador**).")
+                        nome = st.text_input("Nome Completo")
+                        email = st.text_input("Email")
+                        senha = st.text_input("Senha", type="password")
+                        senha_conf = st.text_input("Confirmar Senha", type="password")
+                        sub = st.form_submit_button("Registrar")
+                        if sub:
+                            if not nome or not email or not senha:
+                                st.warning("Todos os campos são obrigatórios.")
+                            elif senha != senha_conf:
+                                st.error("As senhas não conferem.")
+                            else:
+                                try:
+                                    db.inserir_usuario(
+                                        nome=nome,
+                                        email=email,
+                                        perfil="operador",
+                                        senha_hash=sha256_text(senha),
+                                    )
+                                    st.success("Usuário criado! Volte para a aba Login para entrar.")
+                                    db.log("registro_usuario", "sistema", f"Usuário {email} registrado.")
+                                except Exception as e:
+                                    st.error(f"Erro ao criar usuário (email pode já existir): {e}")
+    else:
+        # Orchestrator com LLM da sessão
+        orch = Orchestrator(
+            db=db,
+            validador=validador,
+            memoria=memoria,
+            llm=st.session_state.llm_instance,
+            cofre=cofre,
+        )
+        ui_header()
+        ui_sidebar(orch)
+        ui_tabs(orch, db, cofre, st.session_state.user_profile)
 
 
 if __name__ == "__main__":
