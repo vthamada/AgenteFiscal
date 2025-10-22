@@ -1,14 +1,11 @@
 # banco_de_dados.py
 
 from __future__ import annotations
-from dataclasses import asdict, dataclass
-from typing import Optional, Dict, Any, Iterable
+from typing import Optional, Dict, Any
 from pathlib import Path
-import os
 import sqlite3
 import hashlib
 import datetime as dt
-import json
 
 import pandas as pd
 
@@ -34,13 +31,17 @@ class BancoDeDados:
     def __init__(self, db_path: Path = DB_PATH):
         _ensure_dirs()
         self.db_path = Path(db_path)
+        # check_same_thread=False para permitir uso básico multi-thread no app
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        # Garante que restrições de chave estrangeira (incluindo ON DELETE CASCADE) estejam ativas no SQLite
+        # Garante chave estrangeira e algumas otimizações leves
         try:
             self.conn.execute("PRAGMA foreign_keys = ON")
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+            self.conn.execute("PRAGMA temp_store = MEMORY")
         except sqlite3.DatabaseError:
-            pass  # Em último caso, prossegue sem interromper a inicialização
+            pass
         self._criar_schema()
 
     # ------------------------- Infra & utilidades -------------------------
@@ -70,126 +71,168 @@ class BancoDeDados:
     def _criar_schema(self) -> None:
         cur = self.conn.cursor()
 
+        # DOCUMENTOS
         cur.execute("""
         CREATE TABLE IF NOT EXISTS documentos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome_arquivo TEXT NOT NULL,
-            tipo TEXT,
-            origem TEXT,
-            hash TEXT UNIQUE,
-            chave_acesso TEXT,
-            status TEXT,
-            data_upload TEXT,
-            data_emissao TEXT,
-            emitente_cnpj TEXT,
-            emitente_nome TEXT,
-            destinatario_cnpj TEXT,
-            destinatario_nome TEXT,
-            valor_total REAL,
-            caminho_arquivo TEXT,
-            motivo_rejeicao TEXT
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome_arquivo        TEXT NOT NULL,
+            tipo                TEXT,                 -- NFe, NFCe, CTe, CF-e, pdf, jpg...
+            origem              TEXT,                 -- upload, web, reprocessamento...
+            hash                TEXT UNIQUE,          -- sha256 do arquivo
+            chave_acesso        TEXT,                 -- para NFe/CTe quando existir
+            status              TEXT,                 -- processando, processado, revisao_pendente, revisado, erro, quarentena
+            data_upload         TEXT,                 -- ISO UTC
+            data_emissao        TEXT,                 -- YYYY-MM-DD
+
+            -- Identificação do emitente/destinatário (podem estar criptografados)
+            emitente_cnpj       TEXT,
+            emitente_cpf        TEXT,
+            emitente_nome       TEXT,
+            destinatario_cnpj   TEXT,
+            destinatario_cpf    TEXT,
+            destinatario_nome   TEXT,
+
+            -- Metadados básicos para filtros rápidos
+            inscricao_estadual  TEXT,
+            uf                  TEXT,
+            municipio           TEXT,
+
+            -- Totais de nota (quando disponíveis)
+            valor_total         REAL,
+            total_produtos      REAL,
+            total_servicos      REAL,
+
+            -- Totais de impostos agregados (opcionais; úteis para relatórios)
+            total_icms          REAL,
+            total_ipi           REAL,
+            total_pis           REAL,
+            total_cofins        REAL,
+
+            caminho_arquivo     TEXT,
+            motivo_rejeicao     TEXT,
+            meta_json           TEXT                  -- campo livre para metadados variados
         )
         """)
 
+        # ITENS
         cur.execute("""
         CREATE TABLE IF NOT EXISTS itens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            documento_id INTEGER NOT NULL,
-            descricao TEXT,
-            ncm TEXT,
-            cest TEXT,
-            cfop TEXT,
-            quantidade REAL,
-            unidade TEXT,
-            valor_unitario REAL,
-            valor_total REAL,
-            codigo_produto TEXT,
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            documento_id    INTEGER NOT NULL,
+            numero_item     INTEGER,     -- nItem da NFe quando existir
+            descricao       TEXT,
+            ean             TEXT,
+            ncm             TEXT,
+            cest            TEXT,
+            cfop            TEXT,
+            quantidade      REAL,
+            unidade         TEXT,
+            valor_unitario  REAL,
+            valor_total     REAL,
+            desconto        REAL,
+            outras_despesas REAL,
+            codigo_produto  TEXT,
             FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
         )
         """)
 
+        # IMPOSTOS POR ITEM
         cur.execute("""
         CREATE TABLE IF NOT EXISTS impostos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id INTEGER NOT NULL,
-            tipo_imposto TEXT,
-            cst TEXT,
-            origem TEXT,
-            base_calculo REAL,
-            aliquota REAL,
-            valor REAL,
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id       INTEGER NOT NULL,
+            tipo_imposto  TEXT,     -- ICMS, IPI, PIS, COFINS, ISS etc.
+            cst           TEXT,     -- CST/CSOSN
+            origem        TEXT,     -- 'orig' do ICMS (0..8)
+            base_calculo  REAL,
+            aliquota      REAL,
+            valor         REAL,
             FOREIGN KEY(item_id) REFERENCES itens(id) ON DELETE CASCADE
         )
         """)
 
+        # EXTRACOES (OCR, XML parsing, etc)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS extracoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            documento_id INTEGER NOT NULL,
-            agente TEXT,
-            confianca_media REAL,
-            texto_extraido TEXT,
-            linguagem TEXT,
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            documento_id        INTEGER NOT NULL,
+            agente              TEXT,     -- OCRAgent, XMLParser, etc
+            confianca_media     REAL,
+            texto_extraido      TEXT,
+            linguagem           TEXT,
             tempo_processamento REAL,
-            criado_em TEXT DEFAULT (datetime('now')),
+            criado_em           TEXT DEFAULT (datetime('now')),
             FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
         )
         """)
 
+        # REVISOES manuais
         cur.execute("""
         CREATE TABLE IF NOT EXISTS revisoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            documento_id INTEGER NOT NULL,
-            campo TEXT,
-            valor_anterior TEXT,
-            valor_corrigido TEXT,
-            usuario TEXT,
-            data_revisao TEXT DEFAULT (datetime('now')),
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            documento_id     INTEGER NOT NULL,
+            campo            TEXT,    -- nome do campo revisado
+            valor_anterior   TEXT,
+            valor_corrigido  TEXT,
+            usuario          TEXT,
+            data_revisao     TEXT DEFAULT (datetime('now')),
             FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
         )
-        """)  
+        """)
 
+        # USUARIOS
         cur.execute("""
         CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT,
-            email TEXT UNIQUE,
-            perfil TEXT,
-            senha_hash TEXT
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome        TEXT,
+            email       TEXT UNIQUE,
+            perfil      TEXT,     -- admin, auditor, operador, etc
+            senha_hash  TEXT
         )
-        """) 
+        """)
 
+        # METRICAS
         cur.execute("""
         CREATE TABLE IF NOT EXISTS metricas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tipo_documento TEXT,
-            acuracia_media REAL,
-            taxa_revisao REAL,
-            tempo_medio REAL,
-            taxa_erro REAL,
-            registrado_em TEXT DEFAULT (datetime('now'))
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_documento  TEXT,
+            acuracia_media  REAL,
+            taxa_revisao    REAL,
+            tempo_medio     REAL,
+            taxa_erro       REAL,
+            registrado_em   TEXT DEFAULT (datetime('now'))
         )
-        """) 
+        """)
 
+        # LOGS
         cur.execute("""
         CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            evento TEXT,
-            usuario TEXT,
-            detalhes TEXT,
-            criado_em TEXT DEFAULT (datetime('now'))
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            evento     TEXT,
+            usuario    TEXT,
+            detalhes   TEXT,
+            criado_em  TEXT DEFAULT (datetime('now'))
         )
         """)
 
+        # MEMORIA (para o Agente Analítico)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS memoria (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pergunta TEXT,
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            pergunta        TEXT,
             resposta_resumo TEXT,
-            duracao_s REAL,
-            criado_em TEXT DEFAULT (datetime('now'))
+            duracao_s       REAL,
+            criado_em       TEXT DEFAULT (datetime('now'))
         )
         """)
+
+        # ------------------- Índices úteis para performance -------------------
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_status ON documentos(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_tipo ON documentos(tipo)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_uf ON documentos(uf)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_data_emissao ON documentos(data_emissao)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_itens_doc ON itens(documento_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_impostos_item ON impostos(item_id)")
 
         self.conn.commit()
 
@@ -198,6 +241,8 @@ class BancoDeDados:
         """
         Insere na tabela documentos. Retorna ID.
         """
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_documento.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO documentos ({columns}) VALUES ({placeholders})"
@@ -221,6 +266,8 @@ class BancoDeDados:
         self.conn.commit()
 
     def inserir_item(self, **campos) -> int:
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_item.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO itens ({columns}) VALUES ({placeholders})"
@@ -230,6 +277,8 @@ class BancoDeDados:
         return int(cur.lastrowid)
 
     def inserir_imposto(self, **campos) -> int:
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_imposto.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO impostos ({columns}) VALUES ({placeholders})"
@@ -239,6 +288,8 @@ class BancoDeDados:
         return int(cur.lastrowid)
 
     def inserir_extracao(self, **campos) -> int:
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_extracao.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO extracoes ({columns}) VALUES ({placeholders})"
@@ -247,8 +298,10 @@ class BancoDeDados:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    # --- Métodos CRUD para novas tabelas (Exemplo) ---
+    # --- CRUDs auxiliares ---
     def inserir_revisao(self, **campos) -> int:
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_revisao.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO revisoes ({columns}) VALUES ({placeholders})"
@@ -258,6 +311,8 @@ class BancoDeDados:
         return int(cur.lastrowid)
 
     def inserir_metrica(self, **campos) -> int:
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_metrica.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO metricas ({columns}) VALUES ({placeholders})"
@@ -267,6 +322,8 @@ class BancoDeDados:
         return int(cur.lastrowid)
 
     def inserir_usuario(self, **campos) -> int:
+        if not campos:
+            raise ValueError("Nenhum campo fornecido para inserir_usuario.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO usuarios ({columns}) VALUES ({placeholders})"
@@ -274,7 +331,6 @@ class BancoDeDados:
         cur.execute(sql, list(campos.values()))
         self.conn.commit()
         return int(cur.lastrowid)
-
 
     def log(self, evento: str, usuario: str, detalhes: str) -> None:
         self.conn.execute(
@@ -297,7 +353,7 @@ class BancoDeDados:
         return dict(row) if row else None
 
     def query_table(self, table: str, where: Optional[str] = None) -> pd.DataFrame:
-        # Adiciona as novas tabelas à lista de tabelas permitidas
+        # Tabelas permitidas
         allowed_tables = {
             "documentos", "itens", "impostos", "extracoes",
             "logs", "memoria", "revisoes", "usuarios", "metricas"

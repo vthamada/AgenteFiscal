@@ -1,44 +1,99 @@
 # regras_fiscais.yaml
 meta:
-  versao: "1.0"
-  descricao: "Conjunto básico de regras fiscais para validação e apoio a análises."
+  versao: "1.1"
+  descricao: "Regras fiscais básicas para validação e análises automáticas."
+  autor: "Sistema de Validação Fiscal Inteligente"
+  data_atualizacao: "2025-10-22"
 
+# --- Parâmetros de tolerância ---
 tolerancias:
-  total_documento: 0.05   # R$ 0,05
+  total_documento: 0.05   # Tolerância máxima de diferença no total (R$)
 
+# --- CFOPs válidos ---
 cfop:
   "5101": "Venda de produção do estabelecimento"
   "5102": "Venda de mercadoria adquirida de terceiros"
   "5405": "Venda de mercadoria adquirida de terceiros, ST"
+  "6101": "Venda de produção do estabelecimento - fora do estado"
+  "6108": "Venda de mercadoria adquirida de terceiros - fora do estado"
 
+# --- CST ICMS ---
 cst_icms:
   "00": "Tributada integralmente"
   "10": "Tributada e com cobrança de ICMS por substituição tributária"
   "20": "Com redução de base de cálculo"
   "40": "Isenta"
   "41": "Não tributada"
-  "60": "ICMS cobrado anteriormente - ST"
-  "90": "Outras"
+  "60": "ICMS cobrado anteriormente por substituição tributária"
+  "90": "Outras operações"
 
+# --- CSOSN (Simples Nacional) ---
 csosn_icms:
   "101": "Tributada pelo Simples Nacional com permissão de crédito"
   "102": "Tributada pelo Simples Nacional sem permissão de crédito"
   "103": "Isenção do ICMS no Simples Nacional"
   "201": "Com ST e permissão de crédito"
   "202": "Com ST, sem permissão de crédito"
-  "900": "Outras"
+  "900": "Outras operações"
 
+# --- PIS e COFINS ---
 pis:
   aliquotas_padrao:
     saida: 1.65
     entrada: 1.65
+  observacao: "PIS calculado sobre faturamento ou importação, conforme regime."
 
 cofins:
   aliquotas_padrao:
     saida: 7.60
     entrada: 7.60
+  observacao: "COFINS segue as mesmas regras de base e regime do PIS."
 
-ncm_exemplos:
+# --- IPI (opcional, útil para validação de totais fiscais) ---
+ipi:
+  aliquota_padrao: 5.00
+  observacao: "Aplicável a produtos industrializados conforme TIPI."
+
+# --- NCM (Nomenclatura Comum do Mercosul) ---
+ncm:
   "27101932": "Óleos lubrificantes"
   "30049099": "Medicamentos"
   "22030000": "Cervejas de malte"
+  "87032310": "Automóveis de passageiros, motores 1000-1500cm³"
+  "84713019": "Computadores portáteis (notebooks)"
+
+# --- UF válidas (não obrigatórias, mas úteis para validações regionais) ---
+ufs_validas:
+  - AC
+  - AL
+  - AM
+  - AP
+  - BA
+  - CE
+  - DF
+  - ES
+  - GO
+  - MA
+  - MG
+  - MS
+  - MT
+  - PA
+  - PB
+  - PE
+  - PI
+  - PR
+  - RJ
+  - RN
+  - RO
+  - RR
+  - RS
+  - SC
+  - SE
+  - SP
+  - TO
+
+# --- Municípios de exemplo (não usados diretamente, mas auxiliares) ---
+municipios_exemplo:
+  SP: ["São Paulo", "Campinas", "Santos"]
+  RJ: ["Rio de Janeiro", "Niterói"]
+  MG: ["Belo Horizonte", "Uberlândia", "Contagem"]

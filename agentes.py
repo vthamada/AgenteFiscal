@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 import logging
 import builtins
 import pandas as pd
-import os # Importado para chave de criptografia
+import json
 
 if TYPE_CHECKING:
     from banco_de_dados import BancoDeDados
@@ -135,166 +135,255 @@ def _parse_date_like(s: Optional[str]) -> Optional[str]:
 # ------------------------------ Agente XML Parser (Integrado com Criptografia) ------------------------------
 class AgenteXMLParser:
     """Interpreta XMLs fiscais, criptografa dados sensíveis e popula o banco."""
-    # Recebe a instância do Cofre na inicialização
     def __init__(self, db: "BancoDeDados", validador: "ValidadorFiscal", cofre: "Cofre", metrics_agent: "MetricsAgent"):
         self.db = db
         self.validador = validador
-        self.cofre = cofre # Armazena a instância do Cofre
+        self.cofre = cofre
         self.metrics_agent = metrics_agent
 
     def processar(self, nome: str, conteudo: bytes, origem: str = "upload") -> int:
-        """Processa um arquivo XML, extrai dados, criptografa e os valida."""
+        """Processa um arquivo XML, extrai dados, criptografa e valida."""
         t_start = time.time()
         doc_id = -1
         tipo = "xml/desconhecido"
         status = "erro"
         motivo_rejeicao = "Falha desconhecida no processamento XML"
-        confianca_media = 1.0 # XML é estruturado
+        confianca_media = 1.0  # XML é estruturado
+
+        # 1) Parse seguro do XML (UTF-8 -> Latin-1 fallback)
         try:
             try:
                 root = ET.fromstring(conteudo)
             except ET.ParseError:
                 log.debug("XML '%s' falhou em UTF-8, tentando Latin-1.", nome)
-                root = ET.fromstring(conteudo.decode('latin-1', errors='ignore').encode('utf-8'))
+                root = ET.fromstring(conteudo.decode("latin-1", errors="ignore").encode("utf-8"))
         except Exception as e:
             log.warning("Falha ao parsear XML '%s': %s", nome, e)
             motivo_rejeicao = f"XML mal formado: {e}"
             status = "quarentena"
             tipo = "xml/invalido"
-            doc_id = self.db.inserir_documento(
-                nome_arquivo=nome, tipo=tipo, origem=origem,
-                hash=self.db.hash_bytes(conteudo), status=status,
-                data_upload=self.db.now(), motivo_rejeicao=motivo_rejeicao
-            )
-            # Não retorna aqui, permite que o 'finally' registre a métrica de falha
-
-        try:
-            # Continua apenas se o doc_id foi criado com sucesso no 'except' ou se não houve exceção
-            if doc_id == -1: # Se não houve erro de parse
-                tipo = self._detectar_tipo(root)
-
-                chave_node = root.find('.//{*}infNFe') or root.find('.//{*}infCte')
-                chave = chave_node.get('Id') if chave_node is not None else None
-                if chave: chave = _only_digits(chave)
-
-                emit_node = root.find('.//{*}emit')
-                dest_node = root.find('.//{*}dest')
-                ide_node = root.find('.//{*}ide')
-                total_node = root.find('.//{*}total')
-
-                emit_cnpj = self._find_text(emit_node, 'CNPJ')
-                dest_cnpj_cpf = self._find_text(dest_node, 'CNPJ') or self._find_text(dest_node, 'CPF')
-                emit_nome = _norm_ws(self._find_text(emit_node, 'xNome') or "")
-                dest_nome = _norm_ws(self._find_text(dest_node, 'xNome') or "")
-                d_emis = self._find_text(ide_node, 'dhEmi') or self._find_text(ide_node, 'dEmi')
-
-                valor_total_str = None
-                if tipo in ["NFe", "NFCe", "CF-e"] and total_node is not None:
-                    icms_tot_node = total_node.find('.//{*}ICMSTot')
-                    if icms_tot_node is not None:
-                        valor_total_str = self._find_text(icms_tot_node, 'vNF') or self._find_text(icms_tot_node, 'vCF')
-                elif tipo == "CTe" and total_node is not None:
-                     vprest_node = total_node.find('.//{*}vPrest')
-                     if vprest_node is not None: valor_total_str = self._find_text(vprest_node, 'vTPrest')
-
-                valor_total = _to_float_br(valor_total_str)
-
-                # --- CRIPTOGRAFIA ANTES DE INSERIR ---
-                emit_cnpj_digitos = _only_digits(emit_cnpj)
-                dest_cnpj_cpf_digitos = _only_digits(dest_cnpj_cpf)
-
-                emit_cnpj_cripto = self.cofre.encrypt_text(emit_cnpj_digitos) if emit_cnpj_digitos else None
-                dest_cnpj_cpf_cripto = self.cofre.encrypt_text(dest_cnpj_cpf_digitos) if dest_cnpj_cpf_digitos else None
-                # ------------------------------------
-
+            try:
                 doc_id = self.db.inserir_documento(
-                    nome_arquivo=nome, tipo=tipo, origem=origem, hash=self.db.hash_bytes(conteudo),
-                    chave_acesso=chave, status="processando", data_upload=self.db.now(),
-                    data_emissao=_parse_date_like(d_emis),
-                    emitente_cnpj=emit_cnpj_cripto, emitente_nome=emit_nome,
-                    destinatario_cnpj=dest_cnpj_cpf_cripto, destinatario_nome=dest_nome,
-                    valor_total=valor_total,
-                    caminho_arquivo=str(self.db.save_upload(nome, conteudo))
+                    nome_arquivo=nome,
+                    tipo=tipo,
+                    origem=origem,
+                    hash=self.db.hash_bytes(conteudo),
+                    status=status,
+                    data_upload=self.db.now(),
+                    motivo_rejeicao=motivo_rejeicao,
+                    caminho_arquivo=str(self.db.save_upload(nome, conteudo)),
                 )
+            finally:
+                processing_time = time.time() - t_start
+                if doc_id > 0:
+                    self.db.inserir_extracao(
+                        documento_id=doc_id,
+                        agente="XMLParser",
+                        confianca_media=0.0,
+                        texto_extraido=None,
+                        linguagem="pt",
+                        tempo_processamento=round(processing_time, 3),
+                    )
+                    self.db.log(
+                        "ingestao_xml",
+                        usuario="sistema",
+                        detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}|crypto={'on' if self.cofre.available else 'off'}",
+                    )
+                    self.metrics_agent.registrar_metrica(
+                        db=self.db,
+                        tipo_documento=tipo,
+                        status=status,
+                        confianca_media=0.0,
+                        tempo_medio=processing_time,
+                    )
+            return doc_id
 
-                self._extrair_itens_impostos(root, doc_id)
-                self.validador.validar_documento(doc_id=doc_id, db=self.db) 
+        # 2) Extração principal
+        try:
+            tipo = self._detectar_tipo(root)
 
-                final_doc_info = self.db.get_documento(doc_id)
-                status = final_doc_info.get("status", "processado") if final_doc_info else "erro"
-            
-            # Se doc_id foi definido no 'except' anterior, o status já é 'quarentena'
-            elif doc_id > 0 and status == "quarentena":
-                pass # Mantém o status 'quarentena'
+            # Chave de acesso (infNFe/@Id, infCte/@Id etc.)
+            chave_node = root.find(".//{*}infNFe") or root.find(".//{*}infCte")
+            chave = chave_node.get("Id") if chave_node is not None else None
+            if chave:
+                chave = _only_digits(chave)
+
+            # Nós-chave
+            emit_node = root.find(".//{*}emit")
+            dest_node = root.find(".//{*}dest")
+            ide_node = root.find(".//{*}ide")
+            total_node = root.find(".//{*}total")
+            ender_emit_node = emit_node.find(".//{*}enderEmit") if emit_node is not None else None
+
+            # Emitente/Destinatário - CNPJ/CPF/Nome
+            emit_cnpj = self._find_text(emit_node, "CNPJ")
+            emit_cpf = self._find_text(emit_node, "CPF")
+            dest_cnpj = self._find_text(dest_node, "CNPJ")
+            dest_cpf = self._find_text(dest_node, "CPF")
+
+            emit_nome = _norm_ws(self._find_text(emit_node, "xNome") or "")
+            dest_nome = _norm_ws(self._find_text(dest_node, "xNome") or "")
+
+            # IE, UF, Município
+            inscricao_estadual = self._find_text(emit_node, "IE")
+            uf = self._find_text(ender_emit_node, "UF") if ender_emit_node is not None else None
+            municipio = self._find_text(ender_emit_node, "xMun") if ender_emit_node is not None else None
+
+            # Datas
+            d_emis = self._find_text(ide_node, "dhEmi") or self._find_text(ide_node, "dEmi")
+
+            # Totais (ICMSTot)
+            valor_total_str = None
+            tot_prod = tot_serv = tot_icms = tot_ipi = tot_pis = tot_cofins = None
+            if total_node is not None:
+                icms_tot_node = total_node.find(".//{*}ICMSTot")
+                if icms_tot_node is not None:
+                    valor_total_str = (
+                        self._find_text(icms_tot_node, "vNF")
+                        or self._find_text(icms_tot_node, "vCF")
+                    )
+                    # novos totais
+                    tot_prod = _to_float_br(self._find_text(icms_tot_node, "vProd"))
+                    tot_serv = _to_float_br(self._find_text(icms_tot_node, "vServ"))
+                    tot_icms = _to_float_br(self._find_text(icms_tot_node, "vICMS"))
+                    tot_ipi = _to_float_br(self._find_text(icms_tot_node, "vIPI"))
+                    tot_pis = _to_float_br(self._find_text(icms_tot_node, "vPIS"))
+                    tot_cofins = _to_float_br(self._find_text(icms_tot_node, "vCOFINS"))
+                elif tipo == "CTe":
+                    vprest_node = total_node.find(".//{*}vPrest")
+                    if vprest_node is not None:
+                        valor_total_str = self._find_text(vprest_node, "vTPrest")
+
+            valor_total = _to_float_br(valor_total_str)
+
+            # Criptografia de identificadores (apenas dígitos)
+            emit_cnpj_dig = _only_digits(emit_cnpj)
+            emit_cpf_dig = _only_digits(emit_cpf)
+            dest_cnpj_dig = _only_digits(dest_cnpj)
+            dest_cpf_dig = _only_digits(dest_cpf)
+
+            emit_cnpj_enc = self.cofre.encrypt_text(emit_cnpj_dig) if emit_cnpj_dig else None
+            emit_cpf_enc = self.cofre.encrypt_text(emit_cpf_dig) if emit_cpf_dig else None
+            dest_cnpj_enc = self.cofre.encrypt_text(dest_cnpj_dig) if dest_cnpj_dig else None
+            dest_cpf_enc = self.cofre.encrypt_text(dest_cpf_dig) if dest_cpf_dig else None
+
+            # 3) Inserção do documento
+            doc_id = self.db.inserir_documento(
+                nome_arquivo=nome,
+                tipo=tipo,
+                origem=origem,
+                hash=self.db.hash_bytes(conteudo),
+                chave_acesso=chave,
+                status="processando",
+                data_upload=self.db.now(),
+                data_emissao=_parse_date_like(d_emis),
+                emitente_cnpj=emit_cnpj_enc,
+                emitente_cpf=emit_cpf_enc,
+                emitente_nome=emit_nome,
+                destinatario_cnpj=dest_cnpj_enc,
+                destinatario_cpf=dest_cpf_enc,
+                destinatario_nome=dest_nome,
+                inscricao_estadual=inscricao_estadual,
+                uf=uf,
+                municipio=municipio,
+                valor_total=valor_total,
+                total_produtos=tot_prod,
+                total_servicos=tot_serv,
+                total_icms=tot_icms,
+                total_ipi=tot_ipi,
+                total_pis=tot_pis,
+                total_cofins=tot_cofins,
+                caminho_arquivo=str(self.db.save_upload(nome, conteudo)),
+            )
+
+            # 4) Itens e impostos do XML
+            self._extrair_itens_impostos(root, doc_id)
+
+            # 5) Validação fiscal
+            self.validador.validar_documento(doc_id=doc_id, db=self.db)
+
+            # 6) Status final
+            final_doc_info = self.db.get_documento(doc_id)
+            status = final_doc_info.get("status", "processado") if final_doc_info else "erro"
 
         except Exception as e_proc:
-            log.exception("Erro durante o processamento do XML (doc_id %d): %s", doc_id, e_proc)
+            log.exception("Erro durante o processamento do XML (doc_id %s): %s", doc_id, e_proc)
             motivo_rejeicao = f"Erro no processamento: {e_proc}"
             status = "erro"
             if doc_id > 0:
                 self.db.atualizar_documento_campo(doc_id, "status", status)
                 self.db.atualizar_documento_campo(doc_id, "motivo_rejeicao", motivo_rejeicao)
-            
         finally:
+            # 7) Registro de extração + métricas
             processing_time = time.time() - t_start
-            if doc_id > 0: # Registra extração e métrica se o documento foi criado (mesmo que com erro/quarentena)
-                 self.db.inserir_extracao(
-                    documento_id=doc_id, agente="XMLParser", confianca_media=confianca_media,
-                    texto_extraido=None, linguagem="pt", tempo_processamento=round(processing_time, 3)
+            if doc_id > 0:
+                self.db.inserir_extracao(
+                    documento_id=doc_id,
+                    agente="XMLParser",
+                    confianca_media=confianca_media,
+                    texto_extraido=None,
+                    linguagem="pt",
+                    tempo_processamento=round(processing_time, 3),
                 )
-                 self.db.log("ingestao_xml", usuario="sistema", detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}|crypto={'on' if self.cofre.available else 'off'}")
-                 # Registra Métrica
-                 self.metrics_agent.registrar_metrica(
-                     db=self.db, tipo_documento=tipo, status=status,
-                     confianca_media=confianca_media, tempo_medio=processing_time
-                 )
-            else: # Falha crítica, doc_id não foi criado
-                 # Cria um registro de erro se falhou antes de inserir_documento
-                 doc_id = self.db.inserir_documento(
-                        nome_arquivo=nome, tipo="xml/erro_parse", origem=origem,
-                        hash=self.db.hash_bytes(conteudo), status="erro",
-                        data_upload=self.db.now(), motivo_rejeicao=motivo_rejeicao
-                    )
-                 self.db.log("ingestao_xml_falha", usuario="sistema", detalhes=f"arquivo={nome}|erro={motivo_rejeicao}")
-                 self.metrics_agent.registrar_metrica(
-                     db=self.db, tipo_documento="xml/erro_parse", status="erro",
-                     confianca_media=0.0, tempo_medio=processing_time
-                 )
-
+                self.db.log(
+                    "ingestao_xml",
+                    usuario="sistema",
+                    detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}|crypto={'on' if self.cofre.available else 'off'}",
+                )
+                self.metrics_agent.registrar_metrica(
+                    db=self.db,
+                    tipo_documento=tipo,
+                    status=status,
+                    confianca_media=confianca_media,
+                    tempo_medio=processing_time,
+                )
         return doc_id
 
     def _detectar_tipo(self, root: ET.Element) -> str:
         tag = root.tag.lower()
-        if '}' in tag: tag = tag.split('}', 1)[1]
-        if "cte" in tag: return "CTe"
-        if "mdfe" in tag: return "MDF-e"
-        if "nfe" in tag: return "NFe"
-        is_nfce = root.find('.//{*}ide/{*}mod') is not None and root.find('.//{*}ide/{*}mod').text == '65'
-        if is_nfce: return "NFCe"
-        if "cfe" in tag: return "CF-e" # SAT
+        if "}" in tag:
+            tag = tag.split("}", 1)[1]
+        if "cte" in tag:
+            return "CTe"
+        if "mdfe" in tag:
+            return "MDF-e"
+        if "nfe" in tag:
+            return "NFe"
+        is_nfce = root.find(".//{*}ide/{*}mod") is not None and root.find(".//{*}ide/{*}mod").text == "65"
+        if is_nfce:
+            return "NFCe"
+        if "cfe" in tag:
+            return "CF-e"  # SAT
         return "xml/desconhecido"
 
     def _find_text(self, node: Optional[ET.Element], tag_name: str) -> Optional[str]:
-        if node is None: return None
+        if node is None:
+            return None
         for child in node:
             tag = child.tag
-            if '}' in tag: tag = tag.split('}', 1)[1]
+            if "}" in tag:
+                tag = tag.split("}", 1)[1]
             if tag.lower() == tag_name.lower():
                 return child.text
         return None
 
     def _find_text_any(self, node: Optional[ET.Element], tag_names: Iterable[str]) -> Optional[str]:
-        if node is None: return None
+        if node is None:
+            return None
         for s in tag_names:
             v = self._find_text(node, s)
-            if v: return v
+            if v:
+                return v
         return None
 
     def _extrair_itens_impostos(self, root: ET.Element, doc_id: int) -> None:
-        for det in root.findall('.//{*}det'):
-            prod = det.find('.//{*}prod')
-            imposto = det.find('.//{*}imposto')
-            if prod is None: continue
+        """Extrai itens/impostos do XML (NFe/CTe etc.) e insere nas tabelas relacionadas."""
+        for det in root.findall(".//{*}det"):
+            prod = det.find(".//{*}prod")
+            imposto = det.find(".//{*}imposto")
+            if prod is None:
+                continue
+
             desc = self._find_text(prod, "xProd")
             ncm = self._find_text(prod, "NCM")
             cfop = self._find_text(prod, "CFOP")
@@ -304,12 +393,23 @@ class AgenteXMLParser:
             unid = self._find_text(prod, "uCom")
             cprod = self._find_text(prod, "cProd")
             cest = self._find_text(prod, "CEST")
+
             item_id = self.db.inserir_item(
-                documento_id=doc_id, descricao=desc, ncm=ncm, cest=cest, cfop=cfop,
-                quantidade=qnt, unidade=unid, valor_unitario=vun, valor_total=vtot, codigo_produto=cprod
+                documento_id=doc_id,
+                descricao=desc,
+                ncm=ncm,
+                cest=cest,
+                cfop=cfop,
+                quantidade=qnt,
+                unidade=unid,
+                valor_unitario=vun,
+                valor_total=vtot,
+                codigo_produto=cprod,
             )
+
             if imposto is not None:
-                icms_node = imposto.find('.//{*}ICMS') or imposto.find('.//{*}ICMSUFDest')
+                # ICMS
+                icms_node = imposto.find(".//{*}ICMS") or imposto.find(".//{*}ICMSUFDest")
                 if icms_node:
                     icms_detalhe = next(iter(icms_node), None)
                     if icms_detalhe is not None:
@@ -318,23 +418,73 @@ class AgenteXMLParser:
                         bc = self._find_text_any(icms_detalhe, ["vBC", "vBCST", "vBCSTRet", "vBCUFDest"])
                         aliq = self._find_text_any(icms_detalhe, ["pICMS", "pICMSST", "pICMSSTRet", "pICMSUFDest", "pICMSInter", "pICMSInterPart"])
                         val = self._find_text_any(icms_detalhe, ["vICMS", "vICMSST", "vICMSSTRet", "vICMSUFDest", "vICMSPartDest", "vICMSPartRemet"])
-                        if val is not None: self.db.inserir_imposto(item_id=item_id, tipo_imposto="ICMS", cst=cst, origem=orig, base_calculo=_to_float_br(bc), aliquota=_to_float_br(aliq), valor=_to_float_br(val))
-                ipi_node = imposto.find('.//{*}IPI')
-                ipi_trib_node = ipi_node.find('.//{*}IPITrib') if ipi_node is not None else None
-                if ipi_trib_node:
-                    cst=self._find_text(ipi_trib_node, "CST"); bc=self._find_text(ipi_trib_node, "vBC"); aliq=self._find_text(ipi_trib_node, "pIPI"); val=self._find_text(ipi_trib_node, "vIPI")
-                    if val is not None: self.db.inserir_imposto(item_id=item_id, tipo_imposto="IPI", cst=cst, origem=None, base_calculo=_to_float_br(bc), aliquota=_to_float_br(aliq), valor=_to_float_br(val))
-                pis_node = imposto.find('.//{*}PIS')
-                pis_aliq_node = pis_node.find('.//{*}PISAliq') if pis_node is not None else None
-                if pis_aliq_node:
-                    cst=self._find_text(pis_aliq_node, "CST"); bc=self._find_text(pis_aliq_node, "vBC"); aliq=self._find_text(pis_aliq_node, "pPIS"); val=self._find_text(pis_aliq_node, "vPIS")
-                    if val is not None: self.db.inserir_imposto(item_id=item_id, tipo_imposto="PIS", cst=cst, origem=None, base_calculo=_to_float_br(bc), aliquota=_to_float_br(aliq), valor=_to_float_br(val))
-                cofins_node = imposto.find('.//{*}COFINS')
-                cofins_aliq_node = cofins_node.find('.//{*}COFINSAliq') if cofins_node is not None else None
-                if cofins_aliq_node:
-                    cst=self._find_text(cofins_aliq_node, "CST"); bc=self._find_text(cofins_aliq_node, "vBC"); aliq=self._find_text(cofins_aliq_node, "pCOFINS"); val=self._find_text(cofins_aliq_node, "vCOFINS")
-                    if val is not None: self.db.inserir_imposto(item_id=item_id, tipo_imposto="COFINS", cst=cst, origem=None, base_calculo=_to_float_br(bc), aliquota=_to_float_br(aliq), valor=_to_float_br(val))
+                        if val is not None:
+                            self.db.inserir_imposto(
+                                item_id=item_id,
+                                tipo_imposto="ICMS",
+                                cst=cst,
+                                origem=orig,
+                                base_calculo=_to_float_br(bc),
+                                aliquota=_to_float_br(aliq),
+                                valor=_to_float_br(val),
+                            )
 
+                # IPI
+                ipi_node = imposto.find(".//{*}IPI")
+                ipi_trib_node = ipi_node.find(".//{*}IPITrib") if ipi_node is not None else None
+                if ipi_trib_node:
+                    cst = self._find_text(ipi_trib_node, "CST")
+                    bc = self._find_text(ipi_trib_node, "vBC")
+                    aliq = self._find_text(ipi_trib_node, "pIPI")
+                    val = self._find_text(ipi_trib_node, "vIPI")
+                    if val is not None:
+                        self.db.inserir_imposto(
+                            item_id=item_id,
+                            tipo_imposto="IPI",
+                            cst=cst,
+                            origem=None,
+                            base_calculo=_to_float_br(bc),
+                            aliquota=_to_float_br(aliq),
+                            valor=_to_float_br(val),
+                        )
+
+                # PIS
+                pis_node = imposto.find(".//{*}PIS")
+                pis_aliq_node = pis_node.find(".//{*}PISAliq") if pis_node is not None else None
+                if pis_aliq_node:
+                    cst = self._find_text(pis_aliq_node, "CST")
+                    bc = self._find_text(pis_aliq_node, "vBC")
+                    aliq = self._find_text(pis_aliq_node, "pPIS")
+                    val = self._find_text(pis_aliq_node, "vPIS")
+                    if val is not None:
+                        self.db.inserir_imposto(
+                            item_id=item_id,
+                            tipo_imposto="PIS",
+                            cst=cst,
+                            origem=None,
+                            base_calculo=_to_float_br(bc),
+                            aliquota=_to_float_br(aliq),
+                            valor=_to_float_br(val),
+                        )
+
+                # COFINS
+                cofins_node = imposto.find(".//{*}COFINS")
+                cofins_aliq_node = cofins_node.find(".//{*}COFINSAliq") if cofins_node is not None else None
+                if cofins_aliq_node:
+                    cst = self._find_text(cofins_aliq_node, "CST")
+                    bc = self._find_text(cofins_aliq_node, "vBC")
+                    aliq = self._find_text(cofins_aliq_node, "pCOFINS")
+                    val = self._find_text(cofins_aliq_node, "vCOFINS")
+                    if val is not None:
+                        self.db.inserir_imposto(
+                            item_id=item_id,
+                            tipo_imposto="COFINS",
+                            cst=cst,
+                            origem=None,
+                            base_calculo=_to_float_br(bc),
+                            aliquota=_to_float_br(aliq),
+                            valor=_to_float_br(val),
+                        )
 
 # ------------------------------ Agente OCR (EasyOCR + pypdfium2 com fallback) ------------------------------
 class AgenteOCR:
@@ -734,9 +884,41 @@ class AgenteAnalitico:
              tabela = None
         if fig is not None:
              try:
-                 import matplotlib.figure; import plotly.graph_objects as go
-                 if not isinstance(fig, (matplotlib.figure.Figure, go.Figure)): log.warning(f"'figura' não é suportada: {type(fig)}"); fig = None
-             except ImportError: log.warning("Libs gráficas ausentes para validar figura."); fig = None
+                 # Import dinamicamente para evitar erro de análise estática quando plotly não estiver instalado
+                 import importlib
+                 # Tenta importar a classe Figure do matplotlib se disponível
+                 matplotlib_figure = None
+                 try:
+                     matplotlib_figure = importlib.import_module("matplotlib.figure")
+                 except Exception:
+                     matplotlib_figure = None
+                 # Tenta importar plotly.graph_objects se disponível
+                 go = None
+                 try:
+                     go = importlib.import_module("plotly.graph_objects")
+                 except Exception:
+                     go = None
+
+                 is_matplotlib_fig = False
+                 if matplotlib_figure is not None:
+                     try:
+                         is_matplotlib_fig = isinstance(fig, matplotlib_figure.Figure)
+                     except Exception:
+                         is_matplotlib_fig = False
+
+                 is_plotly_fig = False
+                 if go is not None:
+                     try:
+                         is_plotly_fig = isinstance(fig, go.Figure)
+                     except Exception:
+                         is_plotly_fig = False
+
+                 if not (is_matplotlib_fig or is_plotly_fig):
+                     log.warning(f"'figura' não é suportada: {type(fig)}")
+                     fig = None
+             except Exception:
+                 log.warning("Libs gráficas ausentes para validar figura.")
+                 fig = None
 
         return {"texto": texto, "tabela": tabela, "figuras": [fig] if fig is not None else [], "duracao_s": round(dt, 3), "code": code}
 
@@ -1148,36 +1330,83 @@ class Orchestrator:
 class MetricsAgent:
     """
     Agente responsável por calcular e persistir métricas de performance e qualidade.
-    (Implementação baseada na arquitetura)
+    Agora também agrega dados fiscais e de volume de processamento.
     """
     def __init__(self):
         log.info("MetricsAgent inicializado.")
-        # Em uma implementação real, poderia carregar estado ou configurações
-        pass
 
     def registrar_metrica(self, db: BancoDeDados, tipo_documento: str, status: str, 
                           confianca_media: float, tempo_medio: float):
         """
-        Registra uma métrica de processamento individual na tabela 'metricas'.
-        Esta é uma implementação simplificada. Uma implementação real agregaria
-        os dados antes de salvar para evitar sobrecarga da tabela.
+        Registra ou atualiza métricas agregadas na tabela 'metricas'.
+        Além das métricas anteriores, coleta dados de ICMS/IPI/PIS/COFINS médios.
         """
         try:
-            # Simplificação: Calcula taxas de revisão/erro baseado no status
+            # 1. Taxas básicas
             taxa_revisao = 1.0 if status == 'revisao_pendente' else 0.0
             taxa_erro = 1.0 if status in ('erro', 'quarentena') else 0.0
-            
-            # Insere um registro individual na tabela de métricas
-            # Uma implementação robusta faria agregação (ex: Média por hora/dia/tipo)
+
+            # 2. Busca dados recentes do tipo de documento (para enriquecer métricas)
+            df_docs = db.query_table("documentos", where=f"tipo = '{tipo_documento}'")
+            if df_docs.empty:
+                # Nenhum documento do tipo ainda — salva métrica simples
+                db.inserir_metrica(
+                    tipo_documento=tipo_documento,
+                    acuracia_media=confianca_media,
+                    taxa_revisao=taxa_revisao,
+                    taxa_erro=taxa_erro,
+                    tempo_medio=tempo_medio
+                )
+                log.debug(f"Métrica simples registrada: tipo={tipo_documento}, status={status}")
+                return
+
+            # 3. Cálculo de agregados
+            total_docs = len(df_docs)
+            media_conf = confianca_media
+            media_tempo = tempo_medio
+            media_valor_total = df_docs["valor_total"].mean() if "valor_total" in df_docs else 0.0
+
+            # 4. Agregados fiscais
+            media_icms = df_docs["total_icms"].mean() if "total_icms" in df_docs else 0.0
+            media_ipi = df_docs["total_ipi"].mean() if "total_ipi" in df_docs else 0.0
+            media_pis = df_docs["total_pis"].mean() if "total_pis" in df_docs else 0.0
+            media_cofins = df_docs["total_cofins"].mean() if "total_cofins" in df_docs else 0.0
+
+            # 5. Relações percentuais fiscais
+            taxa_icms_media = (media_icms / media_valor_total * 100) if media_valor_total > 0 else 0.0
+            taxa_ipi_media = (media_ipi / media_valor_total * 100) if media_valor_total > 0 else 0.0
+            taxa_pis_media = (media_pis / media_valor_total * 100) if media_valor_total > 0 else 0.0
+            taxa_cofins_media = (media_cofins / media_valor_total * 100) if media_valor_total > 0 else 0.0
+
+            # 6. Prepara campo meta_json (JSON agregando KPIs)
+            meta = {
+                "total_documentos": total_docs,
+                "media_valor_total": media_valor_total,
+                "media_icms": media_icms,
+                "media_ipi": media_ipi,
+                "media_pis": media_pis,
+                "media_cofins": media_cofins,
+                "taxa_icms_media": taxa_icms_media,
+                "taxa_ipi_media": taxa_ipi_media,
+                "taxa_pis_media": taxa_pis_media,
+                "taxa_cofins_media": taxa_cofins_media,
+            }
+
+            # 7. Insere métrica consolidada
             db.inserir_metrica(
                 tipo_documento=tipo_documento,
-                acuracia_media=confianca_media, # Usa confiança como proxy de acurácia
+                acuracia_media=confianca_media,
                 taxa_revisao=taxa_revisao,
                 taxa_erro=taxa_erro,
-                tempo_medio=tempo_medio
-                # 'registrado_em' é adicionado por padrão pelo DB
+                tempo_medio=media_tempo,
+                meta_json=json.dumps(meta, ensure_ascii=False)
             )
-            log.debug(f"Métrica registrada: tipo={tipo_documento}, status={status}, conf={confianca_media:.2f}")
+
+            log.debug(
+                f"Métrica registrada: tipo={tipo_documento}, conf={confianca_media:.2f}, "
+                f"tempo={tempo_medio:.2f}s, impostos médios ICMS={media_icms:.2f}, PIS={media_pis:.2f}"
+            )
+
         except Exception as e:
             log.error(f"Falha ao registrar métrica: {e}")
-            # Não relança a exceção para não quebrar o pipeline principal de ingestão
+            # Evita quebrar pipeline principal
