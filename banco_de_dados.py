@@ -6,9 +6,11 @@ from pathlib import Path
 import sqlite3
 import hashlib
 import datetime as dt
-
 import pandas as pd
+import json
+import logging
 
+log = logging.getLogger(__name__)
 
 DATA_DIR = Path("data")
 UPLOADS_DIR = DATA_DIR / "uploads"
@@ -299,6 +301,33 @@ class BancoDeDados:
         _add_col_if_missing("logs", "criado_em", "criado_em TEXT")
         _add_col_if_missing("memoria", "criado_em", "criado_em TEXT")
 
+    def _colunas_tabela(self, tabela: str) -> set[str]:
+        cur = self.conn.cursor()
+        cur.execute(f"PRAGMA table_info({tabela})")
+        return {row[1] for row in cur.fetchall()}
+
+    def _filtrar_campos_validos(self, tabela: str, campos: dict) -> dict:
+        """Remove chaves inexistentes e converte dict/list em JSON."""
+        if not campos:
+            return {}
+        colunas_validas = self._colunas_tabela(tabela)
+        filtrados = {}
+        for k, v in campos.items():
+            if k.startswith("__"):
+                continue
+            if k not in colunas_validas:
+                continue
+            if isinstance(v, (dict, list)):
+                try:
+                    v = json.dumps(v, ensure_ascii=False)
+                except Exception:
+                    v = str(v)
+            filtrados[k] = v
+        if len(filtrados) < len(campos):
+            diff = set(campos.keys()) - set(filtrados.keys())
+            log.debug(f"Campos ignorados para '{tabela}': {diff}")
+        return filtrados
+
     # ------------------------- Operações de escrita -------------------------
     def inserir_documento(self, **campos) -> int:
         """
@@ -320,7 +349,12 @@ class BancoDeDados:
         self.conn.commit()
 
     def atualizar_documento_campos(self, documento_id: int, **campos) -> None:
+        """Atualiza apenas colunas existentes na tabela 'documentos'."""
         if not campos:
+            return
+        campos = self._filtrar_campos_validos("documentos", campos)
+        if not campos:
+            log.warning(f"[DB] Nenhum campo válido para atualizar (id={documento_id}).")
             return
         sets = ", ".join(f"{k} = ?" for k in campos.keys())
         vals = list(campos.values()) + [documento_id]

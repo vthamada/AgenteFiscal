@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from banco_de_dados import BancoDeDados
     from validacao import ValidadorFiscal
     from memoria import MemoriaSessao
-    from seguranca import Cofre # Importação direta para TYPE_CHECKING
+    from seguranca import Cofre  # Importação direta para TYPE_CHECKING
 
 # OCR / Imaging (ativados quando instalados no ambiente)
 OCR_AVAILABLE = False
@@ -28,7 +28,7 @@ PDF_RENDERER = None  # 'pdfium' ou 'pdf2image'
 try:
     import easyocr  # type: ignore
     import numpy as np  # type: ignore
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageFilter  # type: ignore
     OCR_AVAILABLE = True
 except Exception as e:
     OCR_AVAILABLE = False
@@ -58,42 +58,69 @@ try:
     from validacao import ValidadorFiscal
     from memoria import MemoriaSessao
     # --- Importação de Segurança ---
-    from seguranca import Cofre, carregar_chave_do_env, CRYPTO_OK # Importa Cofre e helpers
+    from seguranca import Cofre, carregar_chave_do_env, CRYPTO_OK  # Importa Cofre e helpers
     CORE_MODULES_AVAILABLE = True
 except ImportError as e:
     CORE_MODULES_AVAILABLE = False
-    logging.error(f"FALHA CRÍTICA: Não foi possível importar módulos essenciais do projeto (banco_de_dados, validacao, memoria, seguranca): {e}. O Orchestrator não funcionará corretamente.")
+    logging.error(
+        f"FALHA CRÍTICA: Não foi possível importar módulos essenciais do projeto (banco_de_dados, validacao, memoria, seguranca): {e}. O Orchestrator não funcionará corretamente."
+    )
     # Placeholders mínimos
-    BancoDeDados = type('BancoDeDados', (object,), {
-        "inserir_metrica": lambda s, **kwargs: None,
-        "hash_bytes": lambda s, b: "dummy_hash", "now": lambda s: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "save_upload": lambda s, n, c: Path(n), "inserir_documento": lambda s, **kwargs: -1,
-        "find_documento_by_hash": lambda s, h: None, "atualizar_documento_campo": lambda s, id, k, v: None,
-        "log": lambda s, *args, **kwargs: None, "inserir_extracao": lambda s, **kwargs: None,
-        "inserir_item": lambda s, **kwargs: -1, "inserir_imposto": lambda s, **kwargs: None,
-        "atualizar_documento_campos": lambda s, id, **kwargs: None, "get_documento": lambda s, id: {},
-        "query_table": lambda s, t, **kwargs: pd.DataFrame(),
-        "conn": type('Connection', (object,), {"execute": lambda s, *args: None, "commit": lambda s: None}) # Mock de conexão
-    })
+    BancoDeDados = type(
+        "BancoDeDados",
+        (object,),
+        {
+            "inserir_metrica": lambda s, **kwargs: None,
+            "hash_bytes": lambda s, b: "dummy_hash",
+            "now": lambda s: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "save_upload": lambda s, n, c: Path(n),
+            "inserir_documento": lambda s, **kwargs: -1,
+            "find_documento_by_hash": lambda s, h: None,
+            "atualizar_documento_campo": lambda s, id, k, v: None,
+            "log": lambda s, *args, **kwargs: None,
+            "inserir_extracao": lambda s, **kwargs: None,
+            "inserir_item": lambda s, **kwargs: -1,
+            "inserir_imposto": lambda s, **kwargs: None,
+            "atualizar_documento_campos": lambda s, id, **kwargs: None,
+            "get_documento": lambda s, id: {},
+            "query_table": lambda s, t, **kwargs: pd.DataFrame(),
+            "conn": type(
+                "Connection",
+                (object,),
+                {"execute": lambda s, *args: None, "commit": lambda s: None},
+            ),  # Mock de conexão
+        },
+    )
     # O placeholder do ValidadorFiscal agora precisa aceitar 'cofre'
-    ValidadorFiscal = type('ValidadorFiscal', (object,), {
-        "__init__": lambda s, cofre=None: None, # Aceita cofre no init
-        "validar_documento": lambda s, **kwargs: None
-        })
-    MemoriaSessao = type('MemoriaSessao', (object,), {"resumo": lambda s: "Histórico indisponível.", "salvar": lambda s, **kwargs: None})
+    ValidadorFiscal = type(
+        "ValidadorFiscal",
+        (object,),
+        {"__init__": lambda s, cofre=None: None, "validar_documento": lambda s, **kwargs: None},
+    )
+    MemoriaSessao = type(
+        "MemoriaSessao",
+        (object,),
+        {"resumo": lambda s: "Histórico indisponível.", "salvar": lambda s, **kwargs: None},
+    )
     # Placeholders de Segurança
     CRYPTO_OK = False
-    Cofre = type('Cofre', (object,), {
-        "__init__": lambda s, key=None: None, "available": False,
-        "encrypt_text": lambda s, t: t, "decrypt_text": lambda s, t: t # Retorna o texto puro
-    })
+    Cofre = type(
+        "Cofre",
+        (object,),
+        {
+            "__init__": lambda s, key=None: None,
+            "available": False,
+            "encrypt_text": lambda s, t: t,
+            "decrypt_text": lambda s, t: t,  # Retorna o texto puro
+        },
+    )
     carregar_chave_do_env = lambda var_name="APP_SECRET_KEY": None
 
 
 log = logging.getLogger("projeto_fiscal.agentes")
 if not log.handlers:
     handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     log.addHandler(handler)
     log.setLevel(logging.INFO)
@@ -102,41 +129,334 @@ if not log.handlers:
 # ------------------------------ Utilidades comuns ------------------------------
 _WHITESPACE_RE = re.compile(r"\s+", re.S)
 _MONEY_CHARS_RE = re.compile(r"[^\d,\-]")
+_UF_SET = {
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
+    "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
+    "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+}
 
 def _norm_ws(texto: str) -> str:
     """Normaliza espaços em branco em uma string."""
     return _WHITESPACE_RE.sub(" ", (texto or "").strip())
 
+
 def _only_digits(s: Optional[str]) -> Optional[str]:
     """Remove todos os caracteres não numéricos de uma string."""
     return re.sub(r"\D+", "", s) if s else None
 
+
 def _to_float_br(s: Optional[str]) -> Optional[float]:
     """Converte uma string formatada como número brasileiro (com ',' decimal) para float."""
-    if not s: 
+    if not s:
         return None
     s2 = s.strip()
     s2 = _MONEY_CHARS_RE.sub("", s2)
     if s2.count(",") == 1 and (s2.count(".") == 0 or s2.rfind(",") > s2.rfind(".")):
         s2 = s2.replace(".", "").replace(",", ".")
     s2 = s2.replace(",", "")
-    try: 
+    try:
         return float(s2)
-    except ValueError: 
+    except ValueError:
         return None
+
 
 def _parse_date_like(s: Optional[str]) -> Optional[str]:
     """Tenta converter uma string de data (DD/MM/AAAA ou AAAA-MM-DD) para o formato AAAA-MM-DD."""
-    if not s: 
+    if not s:
         return None
     s = s.strip()
     m = re.search(r"(\d{4})[-/](\d{2})[-/](\d{2})(?:[ T]\d{2}:\d{2}:\d{2})?", s)
-    if m: 
+    if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
     m = re.search(r"(\d{2})[-/](\d{2})[-/](\d{4})(?:[ T]\d{2}:\d{2}:\d{2})?", s)
-    if m: 
+    if m:
         return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
     return None
+
+
+def _safe_title(x: Optional[str]) -> Optional[str]:
+    if not x:
+        return x
+    xt = _norm_ws(x)
+    try:
+        # Evitar titlecase agressivo em siglas
+        if len(xt) <= 4 and xt.upper() in _UF_SET:
+            return xt.upper()
+        return xt
+    except Exception:
+        return xt
+
+
+def _clamp(v: Optional[float], lo: float, hi: float) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return max(lo, min(hi, float(v)))
+    except Exception:
+        return None
+
+
+# ------------------------------ NOVOS AGENTES AUXILIARES ------------------------------
+class AgenteNormalizadorCampos:
+    """
+    Normaliza e consolida campos vindos de OCR/NLP/LLM/XML antes de persistir.
+    """
+
+    RE_CIDADE_UF = re.compile(r"\b([A-Za-zÀ-ÿ'`^~\-.\s]{2,})\s*/\s*([A-Za-z]{2})\b")
+
+    def normalizar(self, campos: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(campos or {})
+
+        # Datas
+        for k in ("data_emissao", "data_saida", "data_recebimento", "competencia"):
+            if out.get(k):
+                out[k] = _parse_date_like(str(out.get(k)))
+
+        # Valores
+        for k in (
+            "valor_total",
+            "total_produtos",
+            "total_servicos",
+            "total_icms",
+            "total_ipi",
+            "total_pis",
+            "total_cofins",
+        ):
+            if out.get(k) is not None:
+                out[k] = _to_float_br(str(out.get(k)))
+
+        # CNPJ/CPF (apenas dígitos aqui; criptografia é função do Orchestrator)
+        for k in ("emitente_cnpj", "destinatario_cnpj", "emitente_cpf", "destinatario_cpf"):
+            if out.get(k):
+                out[k] = _only_digits(out.get(k))
+
+        # UF
+        uf = out.get("uf") or None
+        if uf:
+            uf = uf.strip().upper()
+            if uf not in _UF_SET:
+                uf = None
+        out["uf"] = uf
+
+        # Município: tentar remover "/UF"
+        mun = out.get("municipio")
+        if mun:
+            mun = _norm_ws(mun)
+            m = self.RE_CIDADE_UF.search(mun)
+            if m:
+                mun, uf2 = _norm_ws(m.group(1)), (m.group(2) or "").upper()
+                if uf is None and uf2 in _UF_SET:
+                    out["uf"] = uf2
+            out["municipio"] = mun
+
+        # Nomes
+        for k in ("emitente_nome", "destinatario_nome"):
+            if out.get(k):
+                out[k] = _safe_title(out.get(k))
+
+        # Alíquotas (se vierem em %)
+        for k in ("aliquota_icms", "aliquota_ipi", "aliquota_pis", "aliquota_cofins"):
+            if out.get(k) is not None:
+                out[k] = _clamp(_to_float_br(str(out.get(k))), 0, 100)
+
+        # Chave acesso (somente dígitos, 44)
+        if out.get("chave_acesso"):
+            out["chave_acesso"] = (_only_digits(out["chave_acesso"]) or "")[:44] or None
+
+        return out
+
+    def fundir(self, *fontes: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Fusão simples por prioridade: fontes mais à direita têm prioridade por campo não-nulo.
+        Ex.: fundir(nlp, llm, xml_campos) => xml_campos > llm > nlp.
+        """
+        out: Dict[str, Any] = {}
+        for src in fontes:
+            if not src:
+                continue
+            for k, v in src.items():
+                if v in (None, "", [], {}):
+                    continue
+                out[k] = v
+        return out
+
+
+class AgenteLLMMapper:
+    """
+    Mapeia campos a partir de texto OCR usando LLM (opcional).
+    Retorna dicionário só com os campos inferidos + score por campo em `__meta__`.
+    """
+
+    def __init__(self, llm: Optional[BaseChatModel]):
+        self.llm = llm
+
+    def mapear(self, texto: str, nome_arquivo: str = "") -> Dict[str, Any]:
+        if not self.llm or not texto or len(texto) < 20:
+            return {}
+
+        schema_campos = [
+            "emitente_nome",
+            "emitente_cnpj",
+            "emitente_cpf",
+            "destinatario_nome",
+            "destinatario_cnpj",
+            "destinatario_cpf",
+            "inscricao_estadual",
+            "uf",
+            "municipio",
+            "endereco",
+            "valor_total",
+            "data_emissao",
+            "chave_acesso",
+        ]
+        sys = SystemMessage(
+            content=(
+                "Você é um assistente fiscal. Extraia campos de notas brasileiras (NFe/NFCe/NFSe/CTe/CF-e) a partir do TEXTO OCR fornecido. "
+                "Retorne um JSON com chaves exatas do schema e valores de melhor esforço. "
+                "Formate datas como AAAA-MM-DD. Valores monetários no padrão brasileiro podem ser string; não inclua 'R$'. "
+                "Se não souber, retorne null. Adicione um objeto __meta__ com confidence (0..1) por campo."
+            )
+        )
+        user = HumanMessage(
+            content=(
+                f"ARQUIVO: {nome_arquivo}\n"
+                f"TEXTO_OCR:\n{textual_truncate(texto, 4000)}\n\n"
+                f"CAMPO_ALVO (JSON): {json.dumps(schema_campos, ensure_ascii=False)}\n"
+                "RESPOSTA: retorne apenas um JSON único, sem texto extra."
+            )
+        )
+        try:
+            resp = self.llm.invoke([sys, user]).content.strip()
+            # tenta achar JSON
+            m = re.search(r"\{.*\}", resp, re.S)
+            if m:
+                payload = json.loads(m.group(0))
+                if isinstance(payload, dict):
+                    return payload
+        except Exception as e:
+            log.warning(f"LLMMapper falhou: {e}")
+        return {}
+
+
+def textual_truncate(s: str, max_len: int) -> str:
+    s = s or ""
+    if len(s) <= max_len:
+        return s
+    # preserva início e fim
+    head = s[: max_len // 2]
+    tail = s[-max_len // 2 :]
+    return head + "\n...\n" + tail
+
+
+class AgenteAssociadorXML:
+    """
+    Associa um PDF/imagem já ingerido (via OCR) a um XML existente no banco.
+    Estratégias: chave de acesso no OCR, URL QRCode com chNFe=..., e fallback por (data, valor, nome).
+    """
+
+    RE_QR_CHAVE = re.compile(r"(?:chNFe|chCTe)=([0-9]{44})")
+    RE_CHAVE_SECA = re.compile(r"\b(\d{44})\b")
+
+    def __init__(self, db: "BancoDeDados", cofre: "Cofre"):
+        self.db = db
+        self.cofre = cofre
+
+    def _procurar_por_chave(self, chave: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not chave:
+            return None
+        chave = _only_digits(chave)
+        try:
+            df = self.db.query_table("documentos", where=f"chave_acesso = '{chave}'")
+            if not df.empty:
+                # prioriza documentos XML
+                df2 = df[df["tipo"].astype(str).str.contains("xml", case=False, na=False)]
+                row = (df2 if not df2.empty else df).iloc[0].to_dict()
+                return row
+        except Exception as e:
+            log.warning(f"Associador: falha query por chave {chave}: {e}")
+        return None
+
+    def _procurar_por_valor_data(self, valor: Optional[float], data: Optional[str]) -> Optional[Dict[str, Any]]:
+        if valor is None and not data:
+            return None
+        where = []
+        if data:
+            where.append(f"data_emissao = '{data}'")
+        if valor is not None:
+            # tolerância de 1 centavo via CAST quando possível (fallback: igualdade)
+            where.append(f"(ABS(CAST(valor_total AS REAL) - {float(valor):.2f}) <= 0.01 OR valor_total = {float(valor):.2f})")
+        sql = " AND ".join(where) if where else "1=1"
+        try:
+            df = self.db.query_table("documentos", where=sql)
+            if not df.empty:
+                df_xml = df[df["tipo"].astype(str).str.contains("xml|NFe|NFCe|NFSe|CTe|CF-e", case=False, na=False)]
+                row = (df_xml if not df_xml.empty else df).iloc[0].to_dict()
+                return row
+        except Exception as e:
+            log.warning(f"Associador: falha query por valor/data: {e}")
+        return None
+
+    def _extrair_chave_do_texto(self, texto: str) -> Optional[str]:
+        if not texto:
+            return None
+        # Primeiro tenta via parâmetro de URL QRCode
+        m = self.RE_QR_CHAVE.search(texto)
+        if m:
+            return _only_digits(m.group(1))
+        # Depois qualquer sequência de 44 dígitos
+        m2 = self.RE_CHAVE_SECA.search(texto)
+        if m2:
+            return _only_digits(m2.group(1))
+        return None
+
+    def tentar_associar_pdf(self, doc_id: int, campos_parciais: Dict[str, Any], texto_ocr: str = "") -> Dict[str, Any]:
+        """
+        Retorna campos enriquecidos do XML encontrado e atualiza o próprio documento com a chave se for o caso.
+        """
+        # Ordem: 1) chave em campos, 2) chave no OCR, 3) por valor+data
+        chave = campos_parciais.get("chave_acesso") or self._extrair_chave_do_texto(texto_ocr)
+        candidato = None
+        if chave:
+            candidato = self._procurar_por_chave(chave)
+        if not candidato:
+            candidato = self._procurar_por_valor_data(campos_parciais.get("valor_total"), campos_parciais.get("data_emissao"))
+
+        if candidato:
+            try:
+                if chave and not campos_parciais.get("chave_acesso"):
+                    campos_parciais["chave_acesso"] = chave
+                # propaga alguns campos firmes do XML
+                enriquecidos = {
+                    "chave_acesso": candidato.get("chave_acesso") or campos_parciais.get("chave_acesso"),
+                    "tipo": candidato.get("tipo"),
+                    "emitente_nome": candidato.get("emitente_nome") or campos_parciais.get("emitente_nome"),
+                    "destinatario_nome": candidato.get("destinatario_nome") or campos_parciais.get("destinatario_nome"),
+                    "uf": candidato.get("uf") or campos_parciais.get("uf"),
+                    "municipio": candidato.get("municipio") or campos_parciais.get("municipio"),
+                }
+                return {**campos_parciais, **{k: v for k, v in enriquecidos.items() if v}}
+            except Exception as e:
+                log.warning(f"Associador: falha ao enriquecer: {e}")
+        return campos_parciais
+
+
+class AgenteConfiancaRouter:
+    """
+    Decide status final e fonte com base na confiança do OCR e presença de campos críticos.
+    """
+
+    def decidir(self, conf_ocr: float, campos: Dict[str, Any], xml_encontrado: bool = False) -> Dict[str, Any]:
+        tem_basico = bool(campos.get("valor_total") and campos.get("data_emissao"))
+        if xml_encontrado:
+            return {"status": "processado", "fonte": "xml"}
+        if conf_ocr is None:
+            conf_ocr = 0.0
+
+        if conf_ocr >= 0.70 and tem_basico:
+            return {"status": "processado", "fonte": "ocr_nlp"}
+        if conf_ocr >= 0.55 and tem_basico:
+            return {"status": "revisao_pendente", "fonte": "ocr_nlp"}
+        return {"status": "revisao_pendente", "fonte": "ocr_llm" if not tem_basico else "ocr_nlp"}
 
 
 # ------------------------------ Agente XML Parser (Integrado com Criptografia) ------------------------------
@@ -176,7 +496,6 @@ class AgenteXMLParser:
             tipo = self._detectar_tipo(root)
         except Exception as e:
             log.warning("Detecção de tipo falhou: %s", e)
-            # segue como desconhecido; ainda assim tentaremos extrair algo
 
         # 3) Extração principal (com fallbacks por tipo)
         try:
@@ -211,8 +530,9 @@ class AgenteXMLParser:
                 _parse_date_like(self._get_text(root, ".//{*}ide/{*}dhEmi")),
                 _parse_date_like(self._get_text(root, ".//{*}ide/{*}dEmi")),
                 _parse_date_like(self._get_text(root, ".//{*}ide/{*}dIniViagem")),  # MDF-e
-                _parse_date_like(self._get_text(root, ".//{*}DataEmissao")),        # NFSe (algumas variações)
-                _parse_date_like(self._get_text(root, ".//{*}dataEmissao"))
+                _parse_date_like(self._get_text(root, ".//{*}DataEmissao")),  # NFSe (algumas variações)
+                _parse_date_like(self._get_text(root, ".//{*}dataEmissao")),
+                _parse_date_like(self._get_text(root, ".//{*}Competencia")),  # NFSe: competência
             )
 
             # Normaliza nomes (tira espaços bizarros)
@@ -226,7 +546,9 @@ class AgenteXMLParser:
                 endereco = self._build_address(end_emit) if end_emit is not None else None
                 if not endereco:
                     # Algumas prefeituras (NFSe) usam outros nomes
-                    end_nfse = self._find(root, ".//{*}PrestadorServico/{*}Endereco")
+                    end_nfse = self._find(root, ".//{*}PrestadorServico/{*}Endereco") or self._find(
+                        root, ".//{*}Prestador/{*}Endereco"
+                    )
                     endereco = self._build_address_nfse(end_nfse) if end_nfse is not None else None
                 campos["endereco"] = endereco
 
@@ -277,7 +599,6 @@ class AgenteXMLParser:
             try:
                 self.validador.validar_documento(doc_id=doc_id, db=self.db)
             except Exception as e_val:
-                # Não derrubar o pipeline: marca revisão pendente caso válido
                 log.warning("Validação fiscal falhou doc_id=%s: %s", doc_id, e_val)
 
             # Status final (pode ter sido atualizado pelo validador)
@@ -286,7 +607,8 @@ class AgenteXMLParser:
 
         except Exception as e_proc:
             log.exception("Erro durante o processamento do XML (doc_id=%s): %s", doc_id, e_proc)
-            status = "erro"; motivo_rejeicao = f"Erro no processamento: {e_proc}"
+            status = "erro"
+            motivo_rejeicao = f"Erro no processamento: {e_proc}"
             if doc_id > 0:
                 self.db.atualizar_documento_campos(doc_id, status=status, motivo_rejeicao=motivo_rejeicao)
 
@@ -328,9 +650,8 @@ class AgenteXMLParser:
         mod_node = self._find(root, ".//{*}ide")
         mod = None
         if mod_node is not None:
-            # procura filho 'mod' ignorando namespace
             for ch in mod_node.iter():
-                if ch.tag.split('}', 1)[-1].lower() == "mod" and ch.text:
+                if ch.tag.split("}", 1)[-1].lower() == "mod" and ch.text:
                     mod = ch.text.strip()
                     break
         mapa = {"55": "NFe", "65": "NFCe", "57": "CTe", "67": "CTeOS", "58": "MDF-e", "59": "CF-e"}
@@ -338,14 +659,13 @@ class AgenteXMLParser:
             return mapa[mod]
 
         root_tag = root.tag.split("}", 1)[-1].lower()
-        if "nfse" in root_tag or "servico" in root_tag:
+        if "nfse" in root_tag or "servico" in root_tag or "serviço" in root_tag:
             return "NFSe"
 
-        # varredura por nomes de elementos (ignora namespace)
         has_nfse_like = False
         for el in root.iter():
-            lname = el.tag.split('}', 1)[-1].lower()
-            if "nfse" in lname or "servico" in lname:
+            lname = el.tag.split("}", 1)[-1].lower()
+            if "nfse" in lname or "servico" in lname or "serviço" in lname:
                 has_nfse_like = True
                 break
         if has_nfse_like:
@@ -365,18 +685,24 @@ class AgenteXMLParser:
     def _extrair_campos_nfe(self, root: ET.Element) -> Dict[str, Any]:
         emit = self._find(root, ".//{*}emit")
         dest = self._find(root, ".//{*}dest")
-        ide  = self._find(root, ".//{*}ide")
-        tot  = self._find(root, ".//{*}total/{*}ICMSTot")
+        ide = self._find(root, ".//{*}ide")
+        tot = self._find(root, ".//{*}total/{*}ICMSTot")
         end_emit = self._find(root, ".//{*}emit/{*}enderEmit")
 
         endereco = self._build_address(end_emit) if end_emit is not None else None
+        # Extras úteis
+        natOp = self._text(ide, "natOp")
+        tpNF = self._text(ide, "tpNF")
+        cUF = self._text(ide, "cUF")
+        cMunFG = self._text(ide, "cMunFG")
+
         return {
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
-            "emitente_cpf":  self._text(emit, "CPF"),
+            "emitente_cpf": self._text(emit, "CPF"),
             "destinatario_nome": self._text(dest, "xNome"),
             "destinatario_cnpj": self._text(dest, "CNPJ"),
-            "destinatario_cpf":  self._text(dest, "CPF"),
+            "destinatario_cpf": self._text(dest, "CPF"),
             "inscricao_estadual": self._text(emit, "IE"),
             "uf": self._text(end_emit, "UF"),
             "municipio": self._text(end_emit, "xMun"),
@@ -389,15 +715,20 @@ class AgenteXMLParser:
             "total_ipi": _to_float_br(self._text(tot, "vIPI")),
             "total_pis": _to_float_br(self._text(tot, "vPIS")),
             "total_cofins": _to_float_br(self._text(tot, "vCOFINS")),
+            # extras
+            "natOp": natOp,
+            "tpNF": tpNF,
+            "cUF": cUF,
+            "cMunFG": cMunFG,
+            "chave_acesso": (_only_digits(self._get_attr(root, ".//{*}infNFe", "Id")) or None),
         }
 
     def _extrair_campos_cte(self, root: ET.Element) -> Dict[str, Any]:
         emit = self._find(root, ".//{*}emit")
-        rem  = self._find(root, ".//{*}rem")     # remetente
+        rem = self._find(root, ".//{*}rem")  # remetente
         dest = self._find(root, ".//{*}dest") or rem
         vprest = self._find(root, ".//{*}vPrest")
-        ide  = self._find(root, ".//{*}ide")
-        # Nota: CTe usa ide/dhEmi
+        ide = self._find(root, ".//{*}ide")
         return {
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
@@ -407,15 +738,19 @@ class AgenteXMLParser:
             "uf": self._text(emit, "UF") or self._text(dest, "UF"),
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
             "valor_total": _to_float_br(self._text(vprest, "vTPrest")),
-            # Totais itemizados não são padronizados em CTe; deixam-se None
-            "total_produtos": None, "total_servicos": None,
-            "total_icms": None, "total_ipi": None, "total_pis": None, "total_cofins": None,
+            "total_produtos": None,
+            "total_servicos": None,
+            "total_icms": None,
+            "total_ipi": None,
+            "total_pis": None,
+            "total_cofins": None,
+            "chave_acesso": (_only_digits(self._get_attr(root, ".//{*}infCTe", "Id")) or None),
         }
 
     def _extrair_campos_mdfe(self, root: ET.Element) -> Dict[str, Any]:
         emit = self._find(root, ".//{*}emit")
-        ide  = self._find(root, ".//{*}ide")
-        tot  = self._find(root, ".//{*}tot")
+        ide = self._find(root, ".//{*}ide")
+        tot = self._find(root, ".//{*}tot")
         return {
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
@@ -423,8 +758,12 @@ class AgenteXMLParser:
             "uf": self._text(emit, "UF"),
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi")) or self._text(ide, "dIniViagem")),
             "valor_total": _to_float_br(self._text(tot, "vCarga")),
-            "total_produtos": None, "total_servicos": None,
-            "total_icms": None, "total_ipi": None, "total_pis": None, "total_cofins": None,
+            "total_produtos": None,
+            "total_servicos": None,
+            "total_icms": None,
+            "total_ipi": None,
+            "total_pis": None,
+            "total_cofins": None,
         }
 
     def _extrair_campos_cfe(self, root: ET.Element) -> Dict[str, Any]:
@@ -441,79 +780,76 @@ class AgenteXMLParser:
             "uf": self._text(emit, "UF"),
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
             "valor_total": _to_float_br(self._text(total, "vCFe") or self._text(total, "vCFeLei12741") or self._text(total, "vNF")),
-            "total_produtos": None, "total_servicos": None,
-            "total_icms": None, "total_ipi": None, "total_pis": None, "total_cofins": None,
+            "total_produtos": None,
+            "total_servicos": None,
+            "total_icms": None,
+            "total_ipi": None,
+            "total_pis": None,
+            "total_cofins": None,
         }
 
     def _extrair_campos_nfse(self, root: ET.Element) -> Dict[str, Any]:
         """
         NFSe tem muitos layouts (ABRASF e variações municipais). Usamos buscas tolerantes.
         """
-        # Prestador / Tomador
         prest = self._find(root, ".//{*}PrestadorServico") or self._find(root, ".//{*}Prestador")
-        toma  = self._find(root, ".//{*}TomadorServico") or self._find(root, ".//{*}Tomador")
+        toma = self._find(root, ".//{*}TomadorServico") or self._find(root, ".//{*}Tomador")
 
-        # Nomes (várias etiquetas possíveis)
-        emit_nome = (
-            self._get_text(prest, ".//{*}RazaoSocial") or
-            self._get_text(prest, ".//{*}NomeFantasia") or
-            self._get_text(prest, ".//{*}xNome")
-        )
-        dest_nome = (
-            self._get_text(toma, ".//{*}RazaoSocial") or
-            self._get_text(toma, ".//{*}xNome") or
-            self._get_text(toma, ".//{*}Nome")
-        )
+        # Nomes
+        emit_nome = self._get_text(prest, ".//{*}RazaoSocial") or self._get_text(prest, ".//{*}NomeFantasia") or self._get_text(prest, ".//{*}xNome")
+        dest_nome = self._get_text(toma, ".//{*}RazaoSocial") or self._get_text(toma, ".//{*}xNome") or self._get_text(toma, ".//{*}Nome")
 
-        # CNPJ/CPF (múltiplas tags)
-        emit_cnpj = (
-            self._get_text(prest, ".//{*}Cnpj") or
-            self._get_text(prest, ".//{*}CNPJ")
-        )
+        # CNPJ/CPF
+        emit_cnpj = self._get_text(prest, ".//{*}Cnpj") or self._get_text(prest, ".//{*}CNPJ")
         emit_cpf = self._get_text(prest, ".//{*}Cpf") or self._get_text(prest, ".//{*}CPF")
         dest_cnpj = self._get_text(toma, ".//{*}Cnpj") or self._get_text(toma, ".//{*}CNPJ")
-        dest_cpf  = self._get_text(toma, ".//{*}Cpf") or self._get_text(toma, ".//{*}CPF")
+        dest_cpf = self._get_text(toma, ".//{*}Cpf") or self._get_text(toma, ".//{*}CPF")
 
-        # Endereço (montagem dedicada a NFSe)
+        # Endereço
         end_nfse = self._find(prest, ".//{*}Endereco")
         endereco = self._build_address_nfse(end_nfse) if end_nfse is not None else None
 
-        # Totais (várias possibilidades)
+        # Totais
         valor_total = self._coalesce(
             _to_float_br(self._get_text(root, ".//{*}ValorServicos")),
-            _to_float_br(self._get_text(root, ".//{*}vServ"))  # fallback
+            _to_float_br(self._get_text(root, ".//{*}vServ")),
+            _to_float_br(self._get_text(root, ".//{*}ValorLiquidoNfse")),
         )
 
-        # Data de emissão
+        # Data de emissão/competência
         data_emissao = _parse_date_like(
             self._coalesce(
                 self._get_text(root, ".//{*}DataEmissao"),
                 self._get_text(root, ".//{*}dtEmissao"),
-                self._get_text(root, ".//{*}dhEmi")
+                self._get_text(root, ".//{*}dhEmi"),
+                self._get_text(root, ".//{*}Competencia"),
             )
         )
 
         return {
             "emitente_nome": emit_nome,
             "emitente_cnpj": emit_cnpj,
-            "emitente_cpf":  emit_cpf,
+            "emitente_cpf": emit_cpf,
             "destinatario_nome": dest_nome,
             "destinatario_cnpj": dest_cnpj,
-            "destinatario_cpf":  dest_cpf,
+            "destinatario_cpf": dest_cpf,
             "municipio": self._get_text_local(end_nfse, "xMun") or self._get_text_local(end_nfse, "Municipio"),
             "uf": self._get_text_local(end_nfse, "UF") or self._get_text_local(end_nfse, "Estado"),
             "endereco": endereco,
             "data_emissao": data_emissao,
             "valor_total": valor_total,
-            "total_produtos": None, "total_servicos": None,
-            "total_icms": None, "total_ipi": None, "total_pis": None, "total_cofins": None,
+            "total_produtos": None,
+            "total_servicos": None,
+            "total_icms": None,
+            "total_ipi": None,
+            "total_pis": None,
+            "total_cofins": None,
         }
 
     def _extrair_campos_generico(self, root: ET.Element) -> Dict[str, Any]:
-        # Tenta achar emitente básico
         emit = self._find(root, ".//{*}emit") or self._find(root, ".//emit")
         end_emit = self._find(root, ".//{*}enderEmit") or self._find(root, ".//enderEmit")
-        ide  = self._find(root, ".//{*}ide") or self._find(root, ".//ide")
+        ide = self._find(root, ".//{*}ide") or self._find(root, ".//ide")
 
         endereco = self._build_address(end_emit) if end_emit is not None else None
         total = self._find(root, ".//{*}total") or self._find(root, ".//total")
@@ -521,16 +857,18 @@ class AgenteXMLParser:
         return {
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
-            "emitente_cpf":  self._text(emit, "CPF"),
+            "emitente_cpf": self._text(emit, "CPF"),
             "municipio": self._text(end_emit, "xMun"),
             "uf": self._text(end_emit, "UF"),
             "endereco": endereco,
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
-            "valor_total": _to_float_br(
-                self._text(total, "vNF") or self._text(total, "vCFe") or self._text(total, "vTPrest")
-            ),
-            "total_produtos": None, "total_servicos": None,
-            "total_icms": None, "total_ipi": None, "total_pis": None, "total_cofins": None,
+            "valor_total": _to_float_br(self._text(total, "vNF") or self._text(total, "vCFe") or self._text(total, "vTPrest")),
+            "total_produtos": None,
+            "total_servicos": None,
+            "total_icms": None,
+            "total_ipi": None,
+            "total_pis": None,
+            "total_cofins": None,
         }
 
     # -------------------- Itens & Impostos --------------------
@@ -542,10 +880,8 @@ class AgenteXMLParser:
         """
         try:
             if tipo in ("CTe", "CTeOS", "MDF-e", "NFSe"):
-                # Esses modelos não têm a mesma estrutura itemizada de NFe; evitamos falsas leituras.
                 return
 
-            # NFe/NFCe/CF-e: <det><prod>...
             for det in self._findall(root, ".//{*}det"):
                 prod = self._find(det, ".//{*}prod")
                 imposto = self._find(det, ".//{*}imposto")
@@ -576,16 +912,20 @@ class AgenteXMLParser:
                 )
 
                 if imposto is not None:
-                    # ICMS / ICMSUFDest
+                    # ICMS / ICMSUFDest + FCP
                     icms_node = self._find(imposto, ".//{*}ICMS") or self._find(imposto, ".//{*}ICMSUFDest")
                     if icms_node is not None:
-                        icms_detalhe = next(iter(list(icms_node)), None)  # pega o primeiro regime
+                        icms_detalhe = next(iter(list(icms_node)), None)
                         if icms_detalhe is not None:
                             cst = self._text_any(icms_detalhe, ("CST", "CSOSN"))
                             orig = self._text(icms_detalhe, "orig")
                             bc = self._text_any(icms_detalhe, ("vBC", "vBCST", "vBCSTRet", "vBCUFDest"))
-                            aliq = self._text_any(icms_detalhe, ("pICMS", "pICMSST", "pICMSSTRet", "pICMSUFDest", "pICMSInter", "pICMSInterPart"))
-                            val = self._text_any(icms_detalhe, ("vICMS", "vICMSST", "vICMSSTRet", "vICMSUFDest", "vICMSPartDest", "vICMSPartRemet"))
+                            aliq = self._text_any(
+                                icms_detalhe, ("pICMS", "pICMSST", "pICMSSTRet", "pICMSUFDest", "pICMSInter", "pICMSInterPart")
+                            )
+                            val = self._text_any(
+                                icms_detalhe, ("vICMS", "vICMSST", "vICMSSTRet", "vICMSUFDest", "vICMSPartDest", "vICMSPartRemet")
+                            )
                             if val is not None:
                                 self.db.inserir_imposto(
                                     item_id=item_id,
@@ -596,14 +936,27 @@ class AgenteXMLParser:
                                     aliquota=_to_float_br(aliq),
                                     valor=_to_float_br(val),
                                 )
+                            # FCP (se existir)
+                            vFCP = self._text(icms_detalhe, "vFCP")
+                            pFCP = self._text(icms_detalhe, "pFCP")
+                            if vFCP:
+                                self.db.inserir_imposto(
+                                    item_id=item_id,
+                                    tipo_imposto="FCP",
+                                    cst=None,
+                                    origem=None,
+                                    base_calculo=None,
+                                    aliquota=_to_float_br(pFCP),
+                                    valor=_to_float_br(vFCP),
+                                )
 
                     # IPI
                     ipi_node = self._find(imposto, ".//{*}IPI")
                     ipi_trib_node = self._find(ipi_node, ".//{*}IPITrib") if ipi_node is not None else None
                     if ipi_trib_node is not None:
                         cst = self._text(ipi_trib_node, "CST")
-                        bc  = self._text(ipi_trib_node, "vBC")
-                        aliq= self._text(ipi_trib_node, "pIPI")
+                        bc = self._text(ipi_trib_node, "vBC")
+                        aliq = self._text(ipi_trib_node, "pIPI")
                         val = self._text(ipi_trib_node, "vIPI")
                         if val is not None:
                             self.db.inserir_imposto(
@@ -621,8 +974,8 @@ class AgenteXMLParser:
                     pis_aliq = self._find(pis_node, ".//{*}PISAliq") if pis_node is not None else None
                     if pis_aliq is not None:
                         cst = self._text(pis_aliq, "CST")
-                        bc  = self._text(pis_aliq, "vBC")
-                        aliq= self._text(pis_aliq, "pPIS")
+                        bc = self._text(pis_aliq, "vBC")
+                        aliq = self._text(pis_aliq, "pPIS")
                         val = self._text(pis_aliq, "vPIS")
                         if val is not None:
                             self.db.inserir_imposto(
@@ -640,8 +993,8 @@ class AgenteXMLParser:
                     cofins_aliq = self._find(cofins_node, ".//{*}COFINSAliq") if cofins_node is not None else None
                     if cofins_aliq is not None:
                         cst = self._text(cofins_aliq, "CST")
-                        bc  = self._text(cofins_aliq, "vBC")
-                        aliq= self._text(cofins_aliq, "pCOFINS")
+                        bc = self._text(cofins_aliq, "vBC")
+                        aliq = self._text(cofins_aliq, "pCOFINS")
                         val = self._text(cofins_aliq, "vCOFINS")
                         if val is not None:
                             self.db.inserir_imposto(
@@ -654,14 +1007,10 @@ class AgenteXMLParser:
                                 valor=_to_float_br(val),
                             )
         except Exception as e:
-            # Nunca derrubar o pipeline por causa de itens
             log.warning("Falha ao extrair itens/impostos (doc_id=%s, tipo=%s): %s", doc_id, tipo, e)
 
     # -------------------- Fallbacks e Utilidades --------------------
     def _coalesce_total(self, root: ET.Element, tipo: str) -> Optional[float]:
-        """
-        Melhores esforços para achar total quando não foi encontrado pela extração por tipo.
-        """
         candidatos = []
         if tipo in ("NFe", "NFCe"):
             candidatos += [
@@ -680,6 +1029,7 @@ class AgenteXMLParser:
             candidatos += [
                 self._get_text(root, ".//{*}ValorServicos"),
                 self._get_text(root, ".//{*}vServ"),
+                self._get_text(root, ".//{*}ValorLiquidoNfse"),
             ]
 
         # fallback global
@@ -696,7 +1046,6 @@ class AgenteXMLParser:
         return None
 
     def _build_address(self, end_node: Optional[ET.Element]) -> Optional[str]:
-        """Monta endereço padrão SEFAZ: xLgr, nro, xCpl, xBairro, xMun, UF, CEP."""
         if end_node is None:
             return None
         parts = [
@@ -712,12 +1061,12 @@ class AgenteXMLParser:
         return _norm_ws(", ".join(parts)) if parts else None
 
     def _build_address_nfse(self, end_node: Optional[ET.Element]) -> Optional[str]:
-        """Monta endereço típico de NFSe (muitos layouts)."""
         if end_node is None:
             return None
-        # tentativas comuns
         parts = [
-            self._get_text_local(end_node, "Endereco") or self._get_text_local(end_node, "xLgr") or self._get_text_local(end_node, "Logradouro"),
+            self._get_text_local(end_node, "Endereco")
+            or self._get_text_local(end_node, "xLgr")
+            or self._get_text_local(end_node, "Logradouro"),
             self._get_text_local(end_node, "Numero") or self._get_text_local(end_node, "nro"),
             self._get_text_local(end_node, "Complemento") or self._get_text_local(end_node, "xCpl"),
             self._get_text_local(end_node, "Bairro") or self._get_text_local(end_node, "xBairro"),
@@ -732,11 +1081,10 @@ class AgenteXMLParser:
     def _iter_local(self, node: ET.Element, local: str) -> Iterable[ET.Element]:
         lname = local.lower()
         for el in node.iter():
-            if el.tag.split('}', 1)[-1].lower() == lname:
+            if el.tag.split("}", 1)[-1].lower() == lname:
                 yield el
 
     def _find(self, node: ET.Element, xpath: str) -> Optional[ET.Element]:
-        # suporta padrões ".//tag" e ".//{*}tag" via varredura por local-name
         m = re.fullmatch(r"\.//(?:\{\*\})?([A-Za-z0-9_:-]+)", (xpath or "").strip())
         if m:
             target = m.group(1)
@@ -768,7 +1116,7 @@ class AgenteXMLParser:
         except Exception:
             return None
         return None
-    
+
     def _get_text_local(self, node: Optional[ET.Element], local: str) -> Optional[str]:
         if node is None:
             return None
@@ -788,7 +1136,6 @@ class AgenteXMLParser:
         return None
 
     def _text(self, node: Optional[ET.Element], tag_name: str) -> Optional[str]:
-        """Busca direta por nome simples de tag, ignorando namespace."""
         if node is None:
             return None
         for child in node:
@@ -858,6 +1205,8 @@ class AgenteXMLParser:
                     tempo_medio=processing_time,
                 )
         return doc_id
+
+
 # ------------------------------ Agente OCR (EasyOCR + pypdfium2 com fallback) ------------------------------
 class AgenteOCR:
     def __init__(self):
@@ -867,8 +1216,8 @@ class AgenteOCR:
 
         if self.ocr_ok:
             try:
-                # GPU=False para funcionar no Streamlit Cloud/CPU
-                self.reader = easyocr.Reader(["pt", "en"], gpu=False)  # cacheia modelos
+                # GPU=False para funcionar em CPU
+                self.reader = easyocr.Reader(["pt", "en"], gpu=False)
                 log.info("OCR (EasyOCR) disponível.")
             except Exception as e:
                 self.ocr_ok = False
@@ -908,13 +1257,54 @@ class AgenteOCR:
             log.info("OCR '%s' (conf: %.2f) em %.2fs", nome, conf, time.time() - t_start)
         return texto, conf
 
+    # ---------- Pré-processamento leve (numpy/PIL) ----------
+    def _preprocess_pil(self, pil_img: "Image.Image") -> "Image.Image":
+        try:
+            img = pil_img.convert("L")  # grayscale
+            # sharpen leve
+            img = img.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
+            # binarização simples (Otsu manual com numpy)
+            np_img = np.array(img)
+            # Otsu
+            hist, _ = np.histogram(np_img.flatten(), bins=256, range=(0, 256))
+            total = np_img.size
+            sum_total = (np.arange(256) * hist).sum()
+            sumB = 0.0
+            wB = 0.0
+            varMax = 0.0
+            threshold = 127
+            for t in range(256):
+                wB += hist[t]
+                if wB == 0:
+                    continue
+                wF = total - wB
+                if wF == 0:
+                    break
+                sumB += t * hist[t]
+                mB = sumB / wB
+                mF = (sum_total - sumB) / wF
+                varBetween = wB * wF * (mB - mF) ** 2
+                if varBetween > varMax:
+                    varMax = varBetween
+                    threshold = t
+            np_bin = (np_img > threshold).astype("uint8") * 255
+            return Image.fromarray(np_bin)
+        except Exception:
+            # fallback simples: retorno original em L
+            return pil_img.convert("L")
+
     def _ocr_imagem(self, conteudo: bytes) -> Tuple[str, float]:
-        """OCR para imagens com EasyOCR."""
         if not (self.ocr_ok and self.reader):
             return "", 0.0
         try:
-            img = Image.open(io.BytesIO(conteudo)).convert("RGB")
-            np_img = np.array(img)
+            pil = Image.open(io.BytesIO(conteudo)).convert("RGB")
+            # upscale leve ajuda o OCR
+            w, h = pil.size
+            if max(w, h) < 1500:
+                scale = 2
+                pil = pil.resize((w * scale, h * scale))
+            pil = self._preprocess_pil(pil)
+            np_img = np.array(pil)
             results = self.reader.readtext(np_img, detail=1, paragraph=False)
             texto = " ".join([r[1] for r in results]) if results else ""
             confs = [float(r[2]) for r in results] if results else []
@@ -925,30 +1315,51 @@ class AgenteOCR:
             return "", 0.0
 
     def _ocr_pdf(self, conteudo: bytes) -> Tuple[str, float]:
-        """OCR para PDFs: renderiza cada página -> PIL e aplica EasyOCR."""
         if not (self.ocr_ok and self.reader and self.pdf_ok):
             return "", 0.0
         try:
-            full_text = []
+            full_text: List[str] = []
             confs_all: List[float] = []
 
             if PDF_RENDERER == "pdfium":
                 pdf = pdfium.PdfDocument(io.BytesIO(conteudo))
                 for page in pdf:
-                    # scale=2 dá ~144 dpi * 2 (boa leitura) sem estourar memória
                     pil_img = page.render(scale=2).to_pil().convert("RGB")
+                    pil_img = self._preprocess_pil(pil_img)
                     np_img = np.array(pil_img)
-                    results = self.reader.readtext(np_img, detail=1, paragraph=False)
-                    full_text.append(" ".join([r[1] for r in results]) if results else "")
-                    confs_all.extend([float(r[2]) for r in results] if results else [])
-            else:  # PDF_RENDERER == "pdf2image"
+                    # quebra em tiras verticais para melhorar layouts com colunas
+                    H, W = np_img.shape
+                    slices = 3
+                    step = H // slices
+                    results_all = []
+                    for s in range(slices):
+                        a = s * step
+                        b = (s + 1) * step if s < slices - 1 else H
+                        crop = np_img[a:b, :]
+                        results = self.reader.readtext(crop, detail=1, paragraph=False)
+                        results_all.extend(results)
+                    texto_p = " ".join([r[1] for r in results_all]) if results_all else ""
+                    full_text.append(texto_p)
+                    confs_all.extend([float(r[2]) for r in results_all] if results_all else [])
+            else:  # pdf2image
                 images = convert_from_bytes(conteudo, dpi=220)
                 for pil_img in images:
                     pil_img = pil_img.convert("RGB")
+                    pil_img = self._preprocess_pil(pil_img)
                     np_img = np.array(pil_img)
-                    results = self.reader.readtext(np_img, detail=1, paragraph=False)
-                    full_text.append(" ".join([r[1] for r in results]) if results else "")
-                    confs_all.extend([float(r[2]) for r in results] if results else [])
+                    H, W = np_img.shape
+                    slices = 3
+                    step = H // slices
+                    results_all = []
+                    for s in range(slices):
+                        a = s * step
+                        b = (s + 1) * step if s < slices - 1 else H
+                        crop = np_img[a:b, :]
+                        results = self.reader.readtext(crop, detail=1, paragraph=False)
+                        results_all.extend(results)
+                    texto_p = " ".join([r[1] for r in results_all]) if results_all else ""
+                    full_text.append(texto_p)
+                    confs_all.extend([float(r[2]) for r in results_all] if results_all else [])
 
             texto_final = "\n\n--- Page Break ---\n\n".join([t for t in full_text if t])
             media_conf = float(np.mean(confs_all)) if confs_all else 0.0
@@ -957,35 +1368,33 @@ class AgenteOCR:
             log.error(f"Erro OCR PDF (EasyOCR): {e}")
             return "", 0.0
 
-# ------------------------------ Agente NLP (Extração de Itens OCR Mantida) ------------------------------
+
+# ------------------------------ Agente NLP (Extração de Itens OCR Mantida + melhorias) ------------------------------
 class AgenteNLP:
     RE_CNPJ = re.compile(r"\b(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}|\d{14})\b")
     RE_CPF = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2}|\d{11})\b")
-    RE_IE = re.compile(
-        r"\b(?:IE|I\.E\.|INSC(?:RI[ÇC][ÃA]O)?\sESTADUAL)[:\s\-]*([A-Z0-9.\-/]{5,20})\b",
-        re.I,
-    )
-    RE_UF = re.compile(
-        r"\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b"
-    )
+    RE_IE = re.compile(r"\b(?:IE|I\.E\.|INSC(?:RI[ÇC][ÃA]O)?\sESTADUAL)[:\s\-]*([A-Z0-9.\-/]{5,20})\b", re.I)
+    RE_UF = re.compile(r"\b(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)\b")
     RE_VALOR_TOTAL = re.compile(
-        r"\b(?:VALOR\s+TOTAL\s+DA\s+NOTA|VALOR\s+TOTAL|TOTAL\s+DA\s+NOTA)\s*[:\-]?\s*R?\$\s*([\d.,]+)\b",
+        r"\b(?:VALOR\s+TOTAL\s+DA\s+NOTA|VALOR\s+TOTAL\s+DA\s+NF|VALOR\s+TOTAL|TOTAL\s+DA\s+NOTA|VALOR\s+L[IÍ]QUIDO|VALOR\s+A\s+PAGAR)\s*[:\-]?\s*R?\$\s*([\d.,]+)\b",
         re.I,
     )
     RE_DATA_EMISSAO = re.compile(
-        r"\b(?:DATA\s+(?:DE\s+)?EMISS[ÃA]O|EMITIDO\s+EM)\s*[:\-]?\s*(\d{2,4}[-/]\d{2}[-/]\d{2,4})\b",
+        r"\b(?:DATA\s+(?:DE\s+)?EMISS[ÃA]O|EMISS[ÃA]O|EMITIDO\s+EM|COMPET[ÊE]NCIA)\s*[:\-]?\s*(\d{2,4}[-/]\d{2}[-/]\d{2,4})\b",
         re.I,
     )
     RE_ITEM_LINHA = re.compile(
         r"^(?:\d+\s+)?(?P<desc>.+?)\s+(?P<unid>[A-Z]{1,3})\s+(?P<qtd>[\d.,]+)\s+(?P<vun>[\d.,]+)\s+(?P<vtot>[\d.,]+)$",
         re.I | re.M,
     )
-    RE_NCM_ITEM = re.compile(r"NCM[:\s]*(\d{8})", re.I)
-    RE_CFOP_ITEM = re.compile(r"CFOP[:\s]*(\d{4})", re.I)
+    RE_NCM_ITEM = re.compile(r"NCM[:\s]*([0-9]{8})", re.I)
+    RE_CFOP_ITEM = re.compile(r"CFOP[:\s]*([0-9]{4})", re.I)
+    RE_CHAVE = re.compile(r"\b(\d{44})\b")
+    RE_QR = re.compile(r"(?:chNFe|chCTe)=([0-9]{44})")
 
     def extrair_campos(self, texto: str) -> Dict[str, Any]:
-        """Extrai campos principais a partir do texto OCR (retorna CNPJ/CPF sem criptografia)."""
         t_norm = _norm_ws(texto)
+
         cnpjs = [_only_digits(m) for m in self.RE_CNPJ.findall(t_norm)]
         cpfs = [_only_digits(m) for m in self.RE_CPF.findall(t_norm)]
 
@@ -1009,10 +1418,15 @@ class AgenteNLP:
         if not uf_match and municipio_match:
             uf_match = self.RE_UF.search(municipio_match[-10:])
         if not uf_match:
-            uf_match = self.RE_UF.search(t_norm[-100:])
+            uf_match = self.RE_UF.search(t_norm[-200:])
         uf = uf_match.group(1) if uf_match else None
 
-        razao = self._match_after(t_norm, ["razão social", "razao social", "nome", "emitente"], max_len=100)
+        # razão social / emitente
+        razao = self._match_after(
+            t_norm,
+            ["razão social", "razao social", "nome/razão", "emitente", "emitida por", "prestador", "empresa"],
+            max_len=120,
+        )
 
         m_valor = self.RE_VALOR_TOTAL.search(t_norm)
         valor_total = _to_float_br(m_valor.group(1)) if m_valor else None
@@ -1020,9 +1434,14 @@ class AgenteNLP:
         m_data = self.RE_DATA_EMISSAO.search(t_norm)
         data_emissao = _parse_date_like(m_data.group(1)) if m_data else None
 
+        # Chave de acesso possível
+        chave = None
+        mqr = self.RE_QR.search(t_norm) or self.RE_CHAVE.search(t_norm)
+        if mqr:
+            chave = _only_digits(mqr.group(1))
+
         itens_extraidos, impostos_extraidos = self._extrair_itens_impostos_ocr(texto)
 
-        # Retorna CNPJ/CPF *sem* criptografia aqui (apenas dígitos). A criptografia é feita no Orchestrator.
         return {
             "emitente_cnpj": _only_digits(emit_cnpj_cpf) if len(emit_cnpj_cpf or "") >= 14 else None,
             "emitente_cpf": _only_digits(emit_cnpj_cpf) if len(emit_cnpj_cpf or "") == 11 else None,
@@ -1035,12 +1454,12 @@ class AgenteNLP:
             "municipio": municipio_match,
             "valor_total": valor_total,
             "data_emissao": data_emissao,
+            "chave_acesso": chave,
             "itens_ocr": itens_extraidos,
             "impostos_ocr": impostos_extraidos,
         }
 
     def _match_after(self, texto: str, labels: List[str], max_len: int = 80, max_dist: int = 50) -> Optional[str]:
-        """Procura o valor que vem após uma das labels fornecidas."""
         texto_lower = texto.lower()
         best_match = None
         min_pos = float("inf")
@@ -1054,9 +1473,7 @@ class AgenteNLP:
             start_value_idx = -1
             end_label_idx = idx + len(lab_lower)
             for i in range(end_label_idx, min(end_label_idx + max_dist, len(texto))):
-                if texto[i] in ":|-;\n" or (
-                    i == end_label_idx and texto[i].isspace() and not texto[i + 1 : i + 2].isalnum()
-                ):
+                if texto[i] in ":|-;>\n" or (i == end_label_idx and texto[i].isspace() and not texto[i + 1 : i + 2].isalnum()):
                     start_value_idx = i + 1
                     break
 
@@ -1081,7 +1498,6 @@ class AgenteNLP:
         return best_match
 
     def _extrair_itens_impostos_ocr(self, texto_original: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Extrai linhas de itens e impostos a partir do texto OCR (heurística)."""
         itens: List[Dict[str, Any]] = []
         impostos: List[Dict[str, Any]] = []
 
@@ -1089,20 +1505,19 @@ class AgenteNLP:
         inicio_itens = -1
         fim_itens = len(linhas)
 
-        header_keywords = ["DESCRIÇÃO", "QTD", "UNIT", "TOTAL", "PRODUTO"]
+        header_keywords = ["DESCRIÇÃO", "DESCRICAO", "QTD", "QUANT", "UNIT", "UN", "TOTAL", "PRODUTO", "VALOR UNIT"]
         for i, linha in enumerate(linhas):
             linha_upper = linha.upper()
-            if any(kw in linha_upper for kw in header_keywords):
-                if "TOTAL" in linha_upper and len(linha.split()) < 4:
-                    continue
+            score = sum(1 for kw in header_keywords if kw in linha_upper)
+            if score >= 2:  # precisa de pelo menos duas pistas
                 inicio_itens = i + 1
                 break
 
         if inicio_itens == -1:
-            log.warning("Início da seção de itens OCR não encontrado.")
+            log.info("Início da seção de itens OCR não encontrado.")
             return [], []
 
-        total_keywords = ["TOTAL DOS PRODUTOS", "VALOR TOTAL", "SUBTOTAL"]
+        total_keywords = ["TOTAL DOS PRODUTOS", "VALOR TOTAL", "SUBTOTAL", "TOTAL A PAGAR"]
         for i in range(inicio_itens, len(linhas)):
             if any(kw in linhas[i].upper() for kw in total_keywords):
                 fim_itens = i
@@ -1110,7 +1525,7 @@ class AgenteNLP:
 
         item_idx_counter = 0
         for i in range(inicio_itens, fim_itens):
-            linha = linhas[i].strip()
+            linha = _norm_ws(linhas[i].strip())
             if not linha:
                 continue
 
@@ -1127,9 +1542,10 @@ class AgenteNLP:
                     "cfop": None,
                 }
 
+                linha_anterior = linhas[i - 1].strip() if (i - 1) >= inicio_itens else ""
                 linha_seguinte = linhas[i + 1].strip() if (i + 1) < fim_itens else ""
-                ncm_match = self.RE_NCM_ITEM.search(linha) or self.RE_NCM_ITEM.search(linha_seguinte)
-                cfop_match = self.RE_CFOP_ITEM.search(linha) or self.RE_CFOP_ITEM.search(linha_seguinte)
+                ncm_match = self.RE_NCM_ITEM.search(linha) or self.RE_NCM_ITEM.search(linha_seguinte) or self.RE_NCM_ITEM.search(linha_anterior)
+                cfop_match = self.RE_CFOP_ITEM.search(linha) or self.RE_CFOP_ITEM.search(linha_seguinte) or self.RE_CFOP_ITEM.search(linha_anterior)
                 if ncm_match:
                     item["ncm"] = ncm_match.group(1)
                 if cfop_match:
@@ -1137,15 +1553,9 @@ class AgenteNLP:
 
                 itens.append(item)
 
-                icms_match = re.search(r"ICMS.*?(\d+,\d{2})\s*%", linha_seguinte, re.I)
+                icms_match = re.search(r"ICMS.*?(\d+,\d{2})\s*%", linha_seguinte, re.I) or re.search(r"ICMS.*?(\d+,\d{2})\s*%", linha_anterior, re.I)
                 if icms_match:
-                    impostos.append(
-                        {
-                            "item_idx": item_idx_counter,
-                            "tipo_imposto": "ICMS",
-                            "aliquota": _to_float_br(icms_match.group(1)),
-                        }
-                    )
+                    impostos.append({"item_idx": item_idx_counter, "tipo_imposto": "ICMS", "aliquota": _to_float_br(icms_match.group(1))})
 
                 item_idx_counter += 1
 
@@ -1465,9 +1875,52 @@ class Orchestrator:
     db: "BancoDeDados"
     validador: "ValidadorFiscal"
     memoria: "MemoriaSessao"
-    llm: Optional[BaseChatModel] = None
+    llm: Optional["BaseChatModel"] = None
     cofre: "Cofre" = None
     metrics_agent: "MetricsAgent" = None # Agente de Métricas
+
+    # --- Lista branca base (fallback) de colunas válidas da tabela 'documentos'
+    _DOC_COLS_BASE = {
+        "id", "status", "motivo_rejeicao", "chave_acesso",
+        "data_emissao", "emitente_cnpj", "emitente_cpf", "emitente_nome",
+        "destinatario_cnpj", "destinatario_cpf", "destinatario_nome",
+        "inscricao_estadual", "uf", "municipio", "endereco",
+        "valor_total", "total_produtos", "total_servicos",
+        "total_icms", "total_ipi", "total_pis", "total_cofins",
+        "caminho_arquivo", "nome_arquivo", "origem", "tipo",
+        "serie", "numero", "modelo", "ambiente"
+    }
+
+    def _campos_permitidos_documentos(self) -> set:
+        """
+        Obtém dinamicamente as colunas da tabela 'documentos' se o DB expuser esse método.
+        Caso contrário, usa o fallback _DOC_COLS_BASE.
+        """
+        try:
+            getter = getattr(self.db, "colunas_tabela", None) or getattr(self.db, "get_tabela_colunas", None)
+            if getter:
+                cols = getter("documentos")
+                if isinstance(cols, (list, tuple, set)):
+                    return set(cols)
+        except Exception:
+            pass
+        return set(self._DOC_COLS_BASE)
+
+    @staticmethod
+    def _filtrar_campos_validos(d: Dict[str, Any], permitidas: set) -> Dict[str, Any]:
+        """Remove chaves internas (__meta__ etc.) e ignora campos fora do schema."""
+        if not d:
+            return {}
+        limpo: Dict[str, Any] = {}
+        for k, v in d.items():
+            if not k:
+                continue
+            kstr = str(k)
+            if kstr.startswith("__"):  # evita "__meta__", "__debug", etc.
+                continue
+            if kstr in permitidas:
+                limpo[kstr] = v
+        return limpo
 
     def __post_init__(self):
         """Inicializa os agentes, Cofre e Metrics."""
@@ -1481,7 +1934,7 @@ class Orchestrator:
             if self.cofre is None:
                 chave_criptografia = carregar_chave_do_env("APP_SECRET_KEY")
                 self.cofre = Cofre(key=chave_criptografia)
-            if self.cofre.available:
+            if getattr(self.cofre, "available", False):
                 log.info("Criptografia ATIVA.")
             else:
                 log.warning("Criptografia INATIVA.")
@@ -1495,24 +1948,28 @@ class Orchestrator:
         if self.metrics_agent is None:
             self.metrics_agent = MetricsAgent()
 
-        # Passa o validador, cofre e metrics_agent para o XMLAgent
         self.xml_agent = AgenteXMLParser(self.db, self.validador, self.cofre, self.metrics_agent)
         self.ocr_agent = AgenteOCR()
         self.nlp_agent = AgenteNLP()
         self.analitico = AgenteAnalitico(self.llm, self.memoria) if self.llm else None
+        self.normalizador = AgenteNormalizadorCampos()
+        self.associador = AgenteAssociadorXML(self.db, self.cofre)
+        self.router = AgenteConfiancaRouter()
+        self.llm_mapper = AgenteLLMMapper(self.llm) if self.llm else AgenteLLMMapper(None)
 
         if self.llm:
             log.info("Agente Analítico INICIALIZADO.")
         else:
             log.warning("Agente Analítico NÃO inicializado (LLM ausente).")
 
-
     def ingestir_arquivo(self, nome: str, conteudo: bytes, origem: str = "web") -> int:
         """ Processa um arquivo, retornando o ID do documento. """
         t_start=time.time(); doc_id=-1; status="erro"; motivo="?"; doc_hash=self.db.hash_bytes(conteudo); ext=Path(nome).suffix.lower(); tipo_doc = ext.strip('.') or 'binario'
         try:
             existing_id=self.db.find_documento_by_hash(doc_hash)
-            if existing_id: log.info("Doc '%s' (hash %s...) já existe ID %d. Ignorando.", nome, doc_hash[:8], existing_id); return existing_id
+            if existing_id:
+                log.info("Doc '%s' (hash %s...) já existe ID %d. Ignorando.", nome, doc_hash[:8], existing_id)
+                return existing_id
             
             if ext==".xml":
                 tipo_doc = "xml" # Será refinado pelo parser
@@ -1521,36 +1978,60 @@ class Orchestrator:
                 doc_id=self._processar_midias(nome, conteudo, origem)
                 tipo_doc = Path(nome).suffix.lower().strip('.') # Tipo é definido dentro de _processar_midias
             else:
-                motivo=f"Extensão '{ext}' não suportada."; status="quarentena"; log.warning("Arquivo '%s' rejeitado: %s", nome, motivo)
+                motivo=f"Extensão '{ext}' não suportada."; status="quarentena"
+                log.warning("Arquivo '%s' rejeitado: %s", nome, motivo)
                 tipo_doc = "desconhecido"
-                doc_id=self.db.inserir_documento(nome_arquivo=nome, tipo=tipo_doc, origem=origem, hash=doc_hash, status=status, data_upload=self.db.now(), motivo_rejeicao=motivo)
+                doc_id=self.db.inserir_documento(
+                    nome_arquivo=nome, tipo=tipo_doc, origem=origem, hash=doc_hash,
+                    status=status, data_upload=self.db.now(), motivo_rejeicao=motivo
+                )
                 # Registra métrica para arquivo não suportado
-                self.metrics_agent.registrar_metrica(db=self.db, tipo_documento=tipo_doc, status=status, confianca_media=0.0, tempo_medio=(time.time()-t_start))
+                self.metrics_agent.registrar_metrica(
+                    db=self.db, tipo_documento=tipo_doc, status=status,
+                    confianca_media=0.0, tempo_medio=(time.time()-t_start)
+                )
             
             if doc_id > 0:
-                doc_info=self.db.get_documento(doc_id);
-                if doc_info: status = doc_info.get("status", status) # Pega o status final pós-processamento
+                doc_info=self.db.get_documento(doc_id)
+                if doc_info:
+                    status = doc_info.get("status", status) # Pega o status final pós-processamento
         
         except Exception as e:
             log.exception("Falha ingestão '%s': %s", nome, e); motivo=f"Erro: {str(e)}"; status="erro"
             try: # Garante registro do erro
                 existing_id_on_error=self.db.find_documento_by_hash(doc_hash)
-                if existing_id_on_error: doc_id=existing_id_on_error; self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=motivo)
-                elif doc_id > 0: self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=motivo)
-                else: doc_id=self.db.inserir_documento(nome_arquivo=nome, tipo=tipo_doc, origem=origem, hash=doc_hash, status="erro", data_upload=self.db.now(), motivo_rejeicao=motivo)
+                if existing_id_on_error:
+                    doc_id=existing_id_on_error
+                    self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=motivo)
+                elif doc_id > 0:
+                    self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=motivo)
+                else:
+                    doc_id=self.db.inserir_documento(
+                        nome_arquivo=nome, tipo=tipo_doc, origem=origem, hash=doc_hash,
+                        status="erro", data_upload=self.db.now(), motivo_rejeicao=motivo
+                    )
                 # Registra métrica de falha geral
-                self.metrics_agent.registrar_metrica(db=self.db, tipo_documento=tipo_doc, status="erro", confianca_media=0.0, tempo_medio=(time.time()-t_start))
-            except Exception as db_err: log.error("Erro CRÍTICO ao registrar falha '%s': %s", nome, db_err); return -1
+                self.metrics_agent.registrar_metrica(
+                    db=self.db, tipo_documento=tipo_doc, status="erro",
+                    confianca_media=0.0, tempo_medio=(time.time()-t_start)
+                )
+            except Exception as db_err:
+                log.error("Erro CRÍTICO ao registrar falha '%s': %s", nome, db_err)
+                return -1
         
         finally: 
             # O registro de métricas agora é feito dentro dos métodos processar/midias
-            log.info("Ingestão '%s' (ID: %d, Status: %s, Crypto: %s) em %.2fs", nome, doc_id, status, 'on' if self.cofre.available else 'off', time.time()-t_start)
+            log.info(
+                "Ingestão '%s' (ID: %d, Status: %s, Crypto: %s) em %.2fs",
+                nome, doc_id, status, 'on' if getattr(self.cofre, "available", False) else 'off',
+                time.time()-t_start
+            )
         
         return doc_id
 
     def _processar_midias(self, nome: str, conteudo: bytes, origem: str) -> int:
-        """ Processa PDF/Imagem via OCR/NLP com criptografia e registro de métricas. """
-        doc_id = -1; t_start_proc = time.time(); status_final = "erro"; conf = 0.0; tipo_doc = Path(nome).suffix.lower().strip('.')
+        """ Processa PDF/Imagem via OCR/NLP com criptografia, normalização, associação a XML, roteamento e métricas. """
+        doc_id = -1; t_start_proc = time.time(); status_final = "erro"; conf = 0.0; tipo_doc = Path(nome).suffix.lower().strip('.'); fonte_final = "desconhecida"
         try:
             doc_id = self.db.inserir_documento(
                 nome_arquivo=nome, tipo=tipo_doc, origem=origem,
@@ -1558,60 +2039,120 @@ class Orchestrator:
                 data_upload=self.db.now(), caminho_arquivo=str(self.db.save_upload(nome, conteudo))
             )
             log.info("Processando mídia '%s' (doc_id %d)", nome, doc_id)
+
             texto=""; t_start_ocr=time.time()
             try: # Etapa OCR
                 texto, conf = self.ocr_agent.reconhecer(nome, conteudo); ocr_time = time.time()-t_start_ocr
                 log.info(f"OCR doc_id {doc_id}: conf={conf:.2f}, time={ocr_time:.2f}s.")
-                self.db.inserir_extracao(documento_id=doc_id, agente="OCRAgent", confianca_media=float(conf), texto_extraido=texto[:50000]+("..."if len(texto)>50000 else ""), linguagem="pt", tempo_processamento=round(ocr_time,3))
+                self.db.inserir_extracao(
+                    documento_id=doc_id, agente="OCRAgent", confianca_media=float(conf),
+                    texto_extraido=texto[:50000]+("..."if len(texto)>50000 else ""), linguagem="pt",
+                    tempo_processamento=round(ocr_time,3)
+                )
             except Exception as e_ocr:
-                log.error(f"Falha OCR doc_id {doc_id}: {e_ocr}"); status_final="erro"; self.db.atualizar_documento_campos(doc_id, status=status_final, motivo_rejeicao=f"Falha OCR: {e_ocr}"); self.db.log("ocr_erro","sistema",f"doc_id={doc_id}|erro={e_ocr}"); 
+                log.error(f"Falha OCR doc_id {doc_id}: {e_ocr}"); status_final="erro"
+                self.db.atualizar_documento_campos(doc_id, status=status_final, motivo_rejeicao=f"Falha OCR: {e_ocr}")
+                self.db.log("ocr_erro","sistema",f"doc_id={doc_id}|erro={e_ocr}"); 
                 raise # Relança para o finally registrar a métrica de erro
 
+            # ---------- NLP (heurística) ----------
+            campos_nlp: Dict[str, Any] = {}
+            itens_ocr = []
+            impostos_ocr = []
             if texto:
-                try: # Etapa NLP + Save + Validate
+                try:
                     t_start_nlp = time.time(); log.info("NLP doc_id %d...", doc_id)
-                    campos_nlp = self.nlp_agent.extrair_campos(texto); nlp_time = time.time()-t_start_nlp; log.info(f"NLP doc_id {doc_id} em {nlp_time:.2f}s.")
-                    itens_ocr=campos_nlp.pop("itens_ocr",[]); impostos_ocr=campos_nlp.pop("impostos_ocr",[])
-                    # --- CRIPTOGRAFIA ANTES DE ATUALIZAR ---
-                    campos_para_criptografar=["emitente_cnpj","destinatario_cnpj","emitente_cpf","destinatario_cpf"]
-                    for campo in campos_para_criptografar:
-                        if campo in campos_nlp and campos_nlp[campo]:
-                            if getattr(self.cofre, "available", False):
-                                campos_nlp[campo] = self.cofre.encrypt_text(campos_nlp[campo])
-                            else:
-                                log.warning(f"Criptografia desativada - campo '{campo}' salvo em texto puro.")
-                    # ----------------------------------------
-                    self.db.atualizar_documento_campos(doc_id, **campos_nlp) # Salva dados (cripto ou não)
-                    if itens_ocr:
-                        log.info(f"Salvando {len(itens_ocr)} itens OCR doc_id {doc_id}."); item_id_map={}
-                        for idx, item_data in enumerate(itens_ocr): item_id=self.db.inserir_item(documento_id=doc_id,**item_data); item_id_map[idx]=item_id
-                        if impostos_ocr:
-                            log.info(f"Salvando {len(impostos_ocr)} impostos OCR doc_id {doc_id}.")
-                            for imposto_data in impostos_ocr:
-                                item_ocr_idx=imposto_data.pop("item_idx",-1)
-                                if item_ocr_idx in item_id_map: self.db.inserir_imposto(item_id=item_id_map[item_ocr_idx],**imposto_data)
-                                else: log.warning(f"Imposto OCR s/ item idx={item_ocr_idx}, doc_id {doc_id}.")
-                    log.info("Validação doc_id %d pós OCR/NLP...", doc_id)
-                    self.validador.validar_documento(doc_id=doc_id, db=self.db)
-                    doc_info_after=self.db.get_documento(doc_id); status_depois=doc_info_after.get("status") if doc_info_after else "erro"
-                    if status_depois=="revisao_pendente": status_final="revisao_pendente"; log.info(f"Doc {doc_id} para revisão (validação).")
-                    else: limiar_conf=0.60; status_final="processado" if conf>=limiar_conf else "revisao_pendente"; log.info(f"Doc {doc_id} {status_final} (Conf OCR: {conf:.2f}).")
+                    campos_nlp = self.nlp_agent.extrair_campos(texto); nlp_time = time.time()-t_start_nlp
+                    log.info(f"NLP doc_id {doc_id} em {nlp_time:.2f}s.")
+                    itens_ocr = campos_nlp.pop("itens_ocr", []) or []
+                    impostos_ocr = campos_nlp.pop("impostos_ocr", []) or []
                 except Exception as e_nlp:
-                    log.exception(f"Falha NLP/Save doc_id {doc_id}: {e_nlp}"); status_final="erro"
-                    self.db.atualizar_documento_campos(doc_id, status=status_final, motivo_rejeicao=f"Falha NLP/Save: {e_nlp}"); self.db.log("nlp_erro","sistema",f"doc_id={doc_id}|erro={e_nlp}")
-                    raise # Relança para o finally registrar a métrica de erro
-            else: 
-                status_final="revisao_pendente"; log.warning(f"OCR s/ texto doc_id {doc_id} (conf:{conf:.2f}). Revisão pendente."); self.db.atualizar_documento_campos(doc_id, status=status_final, motivo_rejeicao="OCR não extraiu texto.")
-            
-            if status_final != "erro": self.db.atualizar_documento_campo(doc_id,"status",status_final)
-            self.db.log("ingestao_midias","sistema",f"doc_id={doc_id}|conf={conf:.2f}|status={status_final}|crypto={'on' if self.cofre.available else 'off'}")
+                    log.warning(f"NLP falhou doc_id {doc_id}: {e_nlp}")
+                    campos_nlp = {}
+
+            # ---------- LLM Mapper (se necessário) ----------
+            precisa_llm = (conf < 0.65) or not (campos_nlp.get("valor_total") and campos_nlp.get("data_emissao"))
+            campos_llm: Dict[str, Any] = {}
+            if precisa_llm:
+                try:
+                    campos_llm = self.llm_mapper.mapear(texto, nome_arquivo=nome) or {}
+                except Exception as e_map:
+                    log.warning(f"LLMMapper falhou doc_id {doc_id}: {e_map}")
+
+            # ---------- Fusão & Normalização ----------
+            campos_fusao = self.normalizador.fundir(campos_nlp, campos_llm)
+            campos_norm  = self.normalizador.normalizar(campos_fusao)
+
+            # ---------- Associação a XML existente ----------
+            campos_associados = self.associador.tentar_associar_pdf(doc_id, campos_norm, texto_ocr=texto)
+            xml_encontrado = bool(campos_associados.get("tipo") and str(campos_associados.get("tipo")).lower().startswith("xml"))
+
+            # ---------- Roteamento por confiança ----------
+            rota = self.router.decidir(conf_ocr=conf, campos=campos_associados, xml_encontrado=xml_encontrado)
+            status_final = rota.get("status", "revisao_pendente")
+            fonte_final  = rota.get("fonte", "ocr/nlp")
+
+            # --- CRIPTOGRAFIA ANTES DE SALVAR ---
+            for campo in ["emitente_cnpj","destinatario_cnpj","emitente_cpf","destinatario_cpf"]:
+                if campos_associados.get(campo):
+                    if getattr(self.cofre, "available", False):
+                        campos_associados[campo] = self.cofre.encrypt_text(campos_associados[campo])
+                    else:
+                        log.warning(f"Criptografia desativada - campo '{campo}' salvo em texto puro.")
+
+            # --- FILTRA CAMPOS VÁLIDOS (evita '__meta__') ---
+            permitidas = self._campos_permitidos_documentos()
+            campos_safe = self._filtrar_campos_validos(
+                {k:v for k,v in campos_associados.items() if k not in ("itens_ocr","impostos_ocr")},
+                permitidas
+            )
+
+            # Persistência segura
+            if campos_safe:
+                self.db.atualizar_documento_campos(doc_id, **campos_safe)
+
+            # Itens/Impostos OCR (se houver)
+            if itens_ocr:
+                log.info(f"Salvando {len(itens_ocr)} itens OCR doc_id {doc_id}."); item_id_map={}
+                for idx, item_data in enumerate(itens_ocr):
+                    try:
+                        item_id=self.db.inserir_item(documento_id=doc_id,**item_data)
+                        item_id_map[idx]=item_id
+                    except Exception as e_item:
+                        log.warning(f"Falha ao inserir item OCR idx={idx} doc_id={doc_id}: {e_item}")
+                if impostos_ocr:
+                    log.info(f"Salvando {len(impostos_ocr)} impostos OCR doc_id {doc_id}.")
+                    for imposto_data in impostos_ocr:
+                        try:
+                            item_ocr_idx=imposto_data.pop("item_idx",-1)
+                            if item_ocr_idx in item_id_map:
+                                self.db.inserir_imposto(item_id=item_id_map[item_ocr_idx],**imposto_data)
+                            else:
+                                log.warning(f"Imposto OCR s/ item idx={item_ocr_idx}, doc_id {doc_id}.")
+                        except Exception as e_imp:
+                            log.warning(f"Falha ao inserir imposto OCR doc_id={doc_id}: {e_imp}")
+
+            # Validação fiscal
+            try:
+                self.validador.validar_documento(doc_id=doc_id, db=self.db)
+            except Exception as e_val:
+                log.warning(f"Validação fiscal falhou doc_id={doc_id}: {e_val}")
+
+            # Atualiza status final
+            self.db.atualizar_documento_campo(doc_id,"status",status_final)
+            self.db.log(
+                "ingestao_midias","sistema",
+                f"doc_id={doc_id}|conf={conf:.2f}|status={status_final}|fonte={fonte_final}|crypto={'on' if getattr(self.cofre,'available',False) else 'off'}"
+            )
         
         except Exception as e_outer:
              log.exception(f"Falha geral mídia '{nome}': {e_outer}")
              status_final = "erro" # Garante que o status final seja erro
              if doc_id>0:
-                 try: self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=f"Falha geral: {e_outer}")
-                 except Exception as db_err_f: log.error(f"Erro CRÍTICO ao marcar erro final doc_id {doc_id}: {db_err_f}")
+                 try:
+                     self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=f"Falha geral: {e_outer}")
+                 except Exception as db_err_f:
+                     log.error(f"Erro CRÍTICO ao marcar erro final doc_id {doc_id}: {db_err_f}")
              # Não retorna, deixa o finally registrar a métrica
         finally:
             # --- Registra Métrica no Finally ---

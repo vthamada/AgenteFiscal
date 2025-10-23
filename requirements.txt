@@ -16,3 +16,4 @@ langchain-google-genai
 pytest
 pytest-cov
 pytest-html
+dotenv
