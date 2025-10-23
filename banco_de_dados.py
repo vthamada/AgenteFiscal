@@ -1,7 +1,7 @@
 # banco_de_dados.py
 
 from __future__ import annotations
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Iterable
 from pathlib import Path
 import sqlite3
 import hashlib
@@ -25,16 +25,17 @@ def _utcnow_iso() -> str:
 
 class BancoDeDados:
     """
-    Camada de persistência (SQLite) com schema e helpers usados por agentes.py.
+    Camada de persistência (SQLite) com schema completo, índices e migração automática.
+    Compatível com agentes.py, validacao.py e testes integrados.
     """
 
     def __init__(self, db_path: Path = DB_PATH):
         _ensure_dirs()
         self.db_path = Path(db_path)
-        # check_same_thread=False para permitir uso básico multi-thread no app
+        # check_same_thread=False para uso básico multithread (ex.: app web)
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        # Garante chave estrangeira e algumas otimizações leves
+        # Pragmas importantes
         try:
             self.conn.execute("PRAGMA foreign_keys = ON")
             self.conn.execute("PRAGMA journal_mode = WAL")
@@ -42,7 +43,9 @@ class BancoDeDados:
             self.conn.execute("PRAGMA temp_store = MEMORY")
         except sqlite3.DatabaseError:
             pass
+        # Cria (se necessário) e migra o schema para a versão atual
         self._criar_schema()
+        self._migrar_schema_se_preciso()
 
     # ------------------------- Infra & utilidades -------------------------
     def now(self) -> str:
@@ -67,7 +70,7 @@ class BancoDeDados:
             f.write(conteudo)
         return destino
 
-    # ------------------------- Schema -------------------------
+    # ------------------------- Schema (criação base) -------------------------
     def _criar_schema(self) -> None:
         cur = self.conn.cursor()
 
@@ -96,6 +99,7 @@ class BancoDeDados:
             inscricao_estadual  TEXT,
             uf                  TEXT,
             municipio           TEXT,
+            endereco            TEXT,                 
 
             -- Totais de nota (quando disponíveis)
             valor_total         REAL,
@@ -110,7 +114,7 @@ class BancoDeDados:
 
             caminho_arquivo     TEXT,
             motivo_rejeicao     TEXT,
-            meta_json           TEXT                  -- campo livre para metadados variados
+            meta_json           TEXT                  
         )
         """)
 
@@ -119,7 +123,7 @@ class BancoDeDados:
         CREATE TABLE IF NOT EXISTS itens (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             documento_id    INTEGER NOT NULL,
-            numero_item     INTEGER,     -- nItem da NFe quando existir
+            numero_item     INTEGER,     
             descricao       TEXT,
             ean             TEXT,
             ncm             TEXT,
@@ -191,16 +195,17 @@ class BancoDeDados:
         )
         """)
 
-        # METRICAS
+        # METRICAS (inclui meta_json)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS metricas (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            tipo_documento  TEXT,
-            acuracia_media  REAL,
-            taxa_revisao    REAL,
-            tempo_medio     REAL,
-            taxa_erro       REAL,
-            registrado_em   TEXT DEFAULT (datetime('now'))
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tipo_documento TEXT,
+            acuracia_media REAL,
+            taxa_revisao REAL,
+            taxa_erro REAL,
+            tempo_medio REAL,
+            meta_json TEXT,
+            registrado_em TEXT DEFAULT (datetime('now'))
         )
         """)
 
@@ -235,6 +240,64 @@ class BancoDeDados:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_impostos_item ON impostos(item_id)")
 
         self.conn.commit()
+
+    # ------------------------- Migração/Auto-fix do schema -------------------------
+    def _migrar_schema_se_preciso(self) -> None:
+        """
+        Verifica e adiciona colunas que podem faltar em bancos criados antes.
+        Não remove nem renomeia automaticamente (operações destrutivas).
+        """
+        def _colunas(tabela: str) -> set[str]:
+            cur = self.conn.cursor()
+            cur.execute(f"PRAGMA table_info({tabela})")
+            return {row[1] for row in cur.fetchall()}
+
+        def _add_col_if_missing(tabela: str, coluna: str, decl: str) -> None:
+            existentes = _colunas(tabela)
+            if coluna not in existentes:
+                self.conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {decl}")
+                self.conn.commit()
+
+        # documentos: garantir campos usados por OCR/NLP/Validação
+        _add_col_if_missing("documentos", "endereco", "endereco TEXT")
+        _add_col_if_missing("documentos", "meta_json", "meta_json TEXT")
+        _add_col_if_missing("documentos", "chave_acesso", "chave_acesso TEXT")
+        _add_col_if_missing("documentos", "motivo_rejeicao", "motivo_rejeicao TEXT")
+        _add_col_if_missing("documentos", "total_icms", "total_icms REAL")
+        _add_col_if_missing("documentos", "total_ipi", "total_ipi REAL")
+        _add_col_if_missing("documentos", "total_pis", "total_pis REAL")
+        _add_col_if_missing("documentos", "total_cofins", "total_cofins REAL")
+        _add_col_if_missing("documentos", "total_produtos", "total_produtos REAL")
+        _add_col_if_missing("documentos", "total_servicos", "total_servicos REAL")
+
+        # itens: campos adicionais usados pelo XML/NLP
+        _add_col_if_missing("itens", "numero_item", "numero_item INTEGER")
+        _add_col_if_missing("itens", "ean", "ean TEXT")
+        _add_col_if_missing("itens", "cest", "cest TEXT")
+        _add_col_if_missing("itens", "codigo_produto", "codigo_produto TEXT")
+        _add_col_if_missing("itens", "desconto", "desconto REAL")
+        _add_col_if_missing("itens", "outras_despesas", "outras_despesas REAL")
+
+        # impostos: já está completo, mas reforça se faltou algo
+        _add_col_if_missing("impostos", "origem", "origem TEXT")
+        _add_col_if_missing("impostos", "base_calculo", "base_calculo REAL")
+        _add_col_if_missing("impostos", "aliquota", "aliquota REAL")
+        _add_col_if_missing("impostos", "cst", "cst TEXT")
+
+        # extracoes: garantir colunas
+        _add_col_if_missing("extracoes", "agente", "agente TEXT")
+        _add_col_if_missing("extracoes", "confianca_media", "confianca_media REAL")
+        _add_col_if_missing("extracoes", "texto_extraido", "texto_extraido TEXT")
+        _add_col_if_missing("extracoes", "linguagem", "linguagem TEXT")
+        _add_col_if_missing("extracoes", "tempo_processamento", "tempo_processamento REAL")
+        _add_col_if_missing("extracoes", "criado_em", "criado_em TEXT")
+
+        # metricas: meta_json é crítico
+        _add_col_if_missing("metricas", "meta_json", "meta_json TEXT")
+
+        # logs/memoria: garantem created_at se necessário
+        _add_col_if_missing("logs", "criado_em", "criado_em TEXT")
+        _add_col_if_missing("memoria", "criado_em", "criado_em TEXT")
 
     # ------------------------- Operações de escrita -------------------------
     def inserir_documento(self, **campos) -> int:
@@ -298,7 +361,6 @@ class BancoDeDados:
         self.conn.commit()
         return int(cur.lastrowid)
 
-    # --- CRUDs auxiliares ---
     def inserir_revisao(self, **campos) -> int:
         if not campos:
             raise ValueError("Nenhum campo fornecido para inserir_revisao.")
@@ -352,8 +414,12 @@ class BancoDeDados:
         row = cur.fetchone()
         return dict(row) if row else None
 
-    def query_table(self, table: str, where: Optional[str] = None) -> pd.DataFrame:
-        # Tabelas permitidas
+    def query_table(self, table: str, where: Optional[str] = None,
+                    order_by: Optional[str] = None, limit: Optional[int] = None) -> pd.DataFrame:
+        """
+        Consulta tabelas conhecidas. `where` deve ser uma expressão SQL segura (montada internamente no projeto).
+        Parâmetros adicionais `order_by` e `limit` ajudam em telas e análises.
+        """
         allowed_tables = {
             "documentos", "itens", "impostos", "extracoes",
             "logs", "memoria", "revisoes", "usuarios", "metricas"
@@ -363,6 +429,10 @@ class BancoDeDados:
         sql = f"SELECT * FROM {table}"
         if where:
             sql += f" WHERE {where}"
+        if order_by:
+            sql += f" ORDER BY {order_by}"
+        if limit is not None and isinstance(limit, int) and limit > 0:
+            sql += f" LIMIT {limit}"
         return pd.read_sql_query(sql, self.conn)
 
     # ------------------------- Fechamento -------------------------

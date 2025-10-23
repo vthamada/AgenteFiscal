@@ -13,3 +13,6 @@ pypdfium2
 langchain-core
 langchain-openai
 langchain-google-genai
+pytest
+pytest-cov
+pytest-html
