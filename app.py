@@ -10,7 +10,7 @@ import os  # variáveis de ambiente
 from banco_de_dados import BancoDeDados
 from validacao import ValidadorFiscal
 from memoria import MemoriaSessao
-from agentes import Orchestrator
+from orchestrator import Orchestrator
 
 from dotenv import load_dotenv
 
