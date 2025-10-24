@@ -6,7 +6,7 @@ import re
 import logging
 
 # ---------------- Logger único dos agentes ----------------
-log = logging.getLogger("projeto_fiscal.agentes")
+log = logging.getLogger("agente_fiscal.agentes")
 if not log.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")

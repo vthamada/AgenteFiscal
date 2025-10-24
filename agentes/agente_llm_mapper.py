@@ -1,4 +1,4 @@
-# agentes/llm_mapper.py
+# agentes/agente_llm_mapper.py
 
 from __future__ import annotations
 import json
@@ -13,7 +13,7 @@ try:
 except Exception as _e:
     raise ImportError("AgenteLLMMapper requer langchain-core. Instale com `pip install langchain-core`.") from _e
 
-log = logging.getLogger("projeto_fiscal.agentes")
+log = logging.getLogger("agente_fiscal.agentes")
 
 class AgenteLLMMapper:
     """

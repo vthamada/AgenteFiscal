@@ -10,17 +10,13 @@ from functools import lru_cache
 
 if TYPE_CHECKING:
     from banco_de_dados import BancoDeDados
-    # Adiciona Cofre ao type checking para melhor análise estática
-    from seguranca import Cofre
 
 # Importação relativa funciona se os arquivos estiverem na mesma estrutura de diretório
 try:
     from banco_de_dados import BancoDeDados
-    from seguranca import Cofre, CRYPTO_OK, carregar_chave_do_env  # Importa Cofre e status
-    import pandas as pd  # Importa pandas aqui para uso nas validações
+    import pandas as pd  
 except ImportError as e:
     logging.error(f"Erro ao importar módulos necessários (BancoDeDados, seguranca, pandas): {e}")
-    # Placeholders se executado isoladamente ou erro de importação
     BancoDeDados = type(
         "BancoDeDados",
         (object,),
@@ -31,18 +27,6 @@ except ImportError as e:
             "log": lambda s, *args, **kwargs: None,
         },
     )
-    CRYPTO_OK = False
-    Cofre = type(
-        "Cofre",
-        (object,),
-        {
-            "__init__": lambda s, key=None: None,
-            "available": False,
-            "encrypt_text": lambda s, t: t,
-            "decrypt_text": lambda s, t: t,
-        },
-    )
-    carregar_chave_do_env = lambda var_name="APP_SECRET_KEY": None
 
     # Mock do pandas se a importação falhar
     class DataFrameMock:
@@ -69,7 +53,7 @@ except ImportError as e:
     pd = type("pandas", (object,), {"DataFrame": DataFrameMock})
 
 
-log = logging.getLogger("projeto_fiscal.validacao")  # Logger específico do módulo
+log = logging.getLogger("agente_fiscal.validacao")  # Logger específico do módulo
 # Garante que o logger tenha um handler se executado isoladamente
 if not log.handlers:
     handler = logging.StreamHandler()
@@ -98,9 +82,6 @@ def _valida_cnpj(cnpj: Optional[str]) -> bool:
 
     # Remove tudo que não for número
     c = _only_digits(cnpj)
-
-    # Se o valor descriptografado vier com algum ruído (ex: caracteres residuais)
-    c = c.strip()
 
     # Aceita CNPJs genéricos ou de teste (facilita ambiente de dev)
     if c.startswith(("000", "111", "222", "333", "444", "555", "666", "777", "888", "999", "123")):
@@ -149,7 +130,7 @@ def _valida_cpf(cpf: Optional[str]) -> bool:
 
 # --- Carregamento das Regras Fiscais ---
 
-REGRAS_FISCAIS_PATH = Path("regras_fiscais.yaml")  # Define o caminho do arquivo
+REGRAS_FISCAIS_PATH = Path("regras_fiscais.yaml") 
 
 
 @lru_cache(maxsize=1)
@@ -159,12 +140,11 @@ def _carregar_regras_fiscais(path: Path = REGRAS_FISCAIS_PATH) -> Dict[str, Any]
         log.warning(
             f"Arquivo de regras fiscais '{path}' não encontrado. Usando regras padrão."
         )
-        return {}  # Retorna dicionário vazio, forçando fallbacks
+        return {}  
     try:
         with open(path, "r", encoding="utf-8") as f:
             regras = yaml.safe_load(f)
             log.info(f"Regras fiscais carregadas com sucesso de '{path}'.")
-            # Garante que é um dicionário
             return regras if isinstance(regras, dict) else {}
     except yaml.YAMLError as e_yaml:
         log.error(f"Erro de sintaxe ao parsear '{path}': {e_yaml}. Usando regras padrão.")
@@ -179,10 +159,10 @@ def _carregar_regras_fiscais(path: Path = REGRAS_FISCAIS_PATH) -> Dict[str, Any]
 class ValidadorFiscal:
     """
     Aplica regras de validação aos documentos fiscais, utilizando configurações
-    carregadas de um arquivo YAML e descriptografando dados sensíveis se necessário.
+    carregadas de um arquivo YAML.
 
     Regras Atuais:
-    - Valida dígito verificador de CNPJ/CPF (emitente/destinatário) após descriptografia.
+    - Valida dígito verificador de CNPJ/CPF (emitente/destinatário).
     - Compara soma dos itens com valor total do documento (usando tolerância do YAML).
     - Valida totais fiscais agregados (ICMS/IPI/PIS/COFINS) vs. somatório dos itens.
     - Valida CFOP, CST_ICMS, CSOSN_ICMS dos itens/impostos contra listas do YAML.
@@ -191,43 +171,20 @@ class ValidadorFiscal:
     - Atualiza status para "revisao_pendente" se encontrar inconsistências.
     """
 
-    # Aceita a instância do Cofre na inicialização
-    def __init__(self, cofre: Optional[Cofre] = None, regras_path: Path = REGRAS_FISCAIS_PATH):
-        """Inicializa o validador carregando as regras fiscais e configurando o Cofre."""
+    def __init__(self, regras_path: Path = REGRAS_FISCAIS_PATH):
+        """Inicializa o validador carregando as regras fiscais."""
         self.regras = _carregar_regras_fiscais(regras_path)
 
-        # Carrega tolerância com fallback e conversão robusta para float
-        tol_val = self.regras.get("tolerancias", {}).get("total_documento", 0.05)
         try:
-            self.tolerancia_valor = float(tol_val)
+            self.tolerancia_valor = float(self.regras.get("tolerancias", {}).get("total_documento", 0.05))
         except Exception:
             self.tolerancia_valor = 0.05
 
         # Carrega códigos válidos como conjuntos (sets) para lookup eficiente
         self.cfops_validos: Set[str] = set(self.regras.get("cfop", {}).keys())
         self.cst_icms_validos: Set[str] = set(self.regras.get("cst_icms", {}).keys())
-        self.csosn_icms_validos: Set[str] = set(
-            self.regras.get("csosn_icms", {}).keys()
-        )
+        self.csosn_icms_validos: Set[str] = set(self.regras.get("csosn_icms", {}).keys())
         self.ncm_validos: Set[str] = set(self.regras.get("ncm", {}).keys())
-
-        # Configura o Cofre
-        if cofre and CRYPTO_OK:
-            self.cofre = cofre
-            log.info(
-                f"ValidadorFiscal usando instância Cofre fornecida (Crypto: {'on' if self.cofre.available else 'off - chave?'})."
-            )
-        else:
-            self.cofre = Cofre(key=None)  # Cria um cofre dummy
-            log.warning(
-                "ValidadorFiscal operando SEM CRIPTOGRAFIA (Cofre não fornecido ou 'cryptography' ausente)."
-            )
-
-        log.info(
-            f"ValidadorFiscal inicializado. Tolerância: {self.tolerancia_valor:.2f}. "
-            f"CFOPs: {len(self.cfops_validos)}, CSTs: {len(self.cst_icms_validos)}, "
-            f"CSOSNs: {len(self.csosn_icms_validos)}, NCMs: {len(self.ncm_validos)}"
-        )
 
     def validar_documento(
         self,
@@ -270,45 +227,16 @@ class ValidadorFiscal:
             )
             return
 
-        log.info(
-            f"Iniciando validação para doc_id {current_doc_id} (Status atual: {status_atual}). "
-            f"Crypto: {'on' if self.cofre.available else 'off'}"
-        )
+        log.info(f"Iniciando validação para doc_id {current_doc_id} (Status atual: {status_atual}). ")
         inconsistencias: list[str] = []
-        itens_df = pd.DataFrame()  # Inicializa DataFrame vazio
-        impostos_df = pd.DataFrame()  # Inicializa DataFrame vazio
+        itens_df = pd.DataFrame()  
+        impostos_df = pd.DataFrame()  
 
-        # --- Regra 1: Validação de Identificadores (CNPJ/CPF) com Descriptografia ---
+        # --- Regra 1: Validação de Identificadores (CNPJ/CPF) ---
         emit_cnpj_db = doc.get("emitente_cnpj") or ""
         dest_cnpj_db = doc.get("destinatario_cnpj") or ""
         emit_cpf_db = doc.get("emitente_cpf") or ""
         dest_cpf_db = doc.get("destinatario_cpf") or ""
-
-        if self.cofre.available:
-            try:
-                if emit_cnpj_db:
-                    emit_cnpj_db = self.cofre.decrypt_text(emit_cnpj_db)
-            except Exception as e_dec_emit:
-                log.warning(
-                    f"Doc {current_doc_id}: Falha ao descriptografar emitente_cnpj: {e_dec_emit}"
-                )
-            try:
-                if dest_cnpj_db:
-                    dest_cnpj_db = self.cofre.decrypt_text(dest_cnpj_db)
-            except Exception as e_dec_dest:
-                log.warning(
-                    f"Doc {current_doc_id}: Falha ao descriptografar destinatario_cnpj: {e_dec_dest}"
-                )
-            try:
-                if emit_cpf_db:
-                    emit_cpf_db = self.cofre.decrypt_text(emit_cpf_db)
-            except Exception:
-                pass
-            try:
-                if dest_cpf_db:
-                    dest_cpf_db = self.cofre.decrypt_text(dest_cpf_db)
-            except Exception:
-                pass
 
         # CNPJ
         if emit_cnpj_db and not _valida_cnpj(emit_cnpj_db):
@@ -413,7 +341,7 @@ class ValidadorFiscal:
         # --- Regra 3: Validação de Códigos (CFOP, CST/CSOSN, NCM opcional) ---
         if not getattr(itens_df, "empty", True):
             # Validação de CFOP
-            if self.cfops_validos and "cfop" in getattr(itens_df, "columns", []):  # Só valida se a lista foi carregada e a coluna existir
+            if self.cfops_validos and "cfop" in getattr(itens_df, "columns", []):  
                 for index, item in itens_df.iterrows():
                     cfop_item = (
                         str(item.get("cfop", "")).strip()

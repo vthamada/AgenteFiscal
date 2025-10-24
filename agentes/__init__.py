@@ -17,6 +17,7 @@ from .utils import log, _UF_SET
 CORE_MODULES_AVAILABLE = True
 
 __all__ = [
+    "AgenteLLMMapper",
     "AgenteXMLParser",
     "AgenteOCR",
     "AgenteNLP",

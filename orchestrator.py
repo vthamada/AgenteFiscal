@@ -13,7 +13,6 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 try:
-    from seguranca import Cofre, carregar_chave_do_env, CRYPTO_OK
     from validacao import ValidadorFiscal
     from agentes import (  
         AgenteLLMMapper,
@@ -30,8 +29,7 @@ try:
     from memoria import MemoriaSessao
     from banco_de_dados import BancoDeDados
     from langchain_core.language_models.chat_models import BaseChatModel
-except Exception:  
-    from seguranca import Cofre, carregar_chave_do_env, CRYPTO_OK  
+except Exception:   
     from validacao import ValidadorFiscal  
     from agentes import (  
         AgenteLLMMapper,
@@ -60,7 +58,6 @@ class Orchestrator:
     validador: "ValidadorFiscal"
     memoria: "MemoriaSessao"
     llm: Optional["BaseChatModel"] = None
-    cofre: Optional["Cofre"] = None
     metrics_agent: Optional["MetricsAgent"] = None
 
     def __init__(
@@ -69,13 +66,11 @@ class Orchestrator:
         validador: Optional["ValidadorFiscal"] = None,
         memoria: Optional["MemoriaSessao"] = None,
         llm: Optional["BaseChatModel"] = None,
-        cofre: Optional["Cofre"] = None,
     ):
         self.db = db
         self.validador = validador
         self.memoria = memoria
         self.llm = llm
-        self.cofre = cofre
         self.metrics_agent = None
         self.__post_init__()
 
@@ -171,37 +166,19 @@ class Orchestrator:
 
     # ----------------------- Init -----------------------
     def __post_init__(self):
-        """Inicializa agentes, Cofre e Métricas."""
-        if not CORE_MODULES_AVAILABLE:
-            log.error("Orchestrator: Módulos CORE ausentes.")
-            if self.cofre is None:
-                self.cofre = Cofre(key=None)
-            if getattr(self, "validador", None) is None:
-                self.validador = ValidadorFiscal(cofre=self.cofre)
-        else:
-            if self.cofre is None:
-                chave_criptografia = carregar_chave_do_env("APP_SECRET_KEY")
-                self.cofre = Cofre(key=chave_criptografia)
-            if getattr(self.cofre, "available", False):
-                log.info("Criptografia ATIVA.")
-            else:
-                log.warning("Criptografia INATIVA.")
-                if not CRYPTO_OK:
-                    log.warning("-> Lib 'cryptography' ausente.")
-
-            if getattr(self, "validador", None) is None:
-                self.validador = ValidadorFiscal(cofre=self.cofre)
+        """Inicializa agentes e métricas."""
+        if getattr(self, "validador", None) is None:
+            self.validador = ValidadorFiscal()
 
         if self.metrics_agent is None:
             self.metrics_agent = MetricsAgent()
 
-        # Agentes principais
-        self.xml_agent = AgenteXMLParser(self.db, self.validador, self.cofre, self.metrics_agent)
+        self.xml_agent = AgenteXMLParser(self.db, self.validador, self.metrics_agent)
         self.ocr_agent = AgenteOCR()
         self.nlp_agent = AgenteNLP()
         self.analitico = AgenteAnalitico(self.llm, self.memoria) if self.llm else None
         self.normalizador = AgenteNormalizadorCampos()
-        self.associador = AgenteAssociadorXML(self.db, self.cofre)
+        self.associador = AgenteAssociadorXML(self.db)
         self.router = AgenteConfiancaRouter()
         self.llm_mapper = AgenteLLMMapper(self.llm) if self.llm else AgenteLLMMapper(None)
 
@@ -318,24 +295,45 @@ class Orchestrator:
             # ---------- OCR ----------
             texto = ""
             t_start_ocr = time.time()
+            ocr_tipo = "ocr"
             try:
+                # Executa OCR (internamente ele detecta se o PDF tem texto nativo)
                 texto, conf = self.ocr_agent.reconhecer(nome, conteudo)
                 ocr_time = time.time() - t_start_ocr
-                log.info("OCR doc_id %d: conf=%.2f, time=%.2fs.", doc_id, conf, ocr_time)
-                self.db.inserir_extracao(
-                    documento_id=doc_id,
-                    agente="OCRAgent",
-                    confianca_media=float(conf),
-                    texto_extraido=texto[:50000] + ("..." if len(texto) > 50000 else ""),
-                    linguagem="pt",
-                    tempo_processamento=round(ocr_time, 3),
+
+                # Detecta se o texto é nativo (extraído direto do PDF)
+                if conf >= 0.98:
+                    ocr_tipo = "nativo"
+
+                log.info(
+                    "OCR doc_id %d: tipo=%s conf=%.2f tempo=%.2fs len_texto=%d",
+                    doc_id, ocr_tipo, conf, ocr_time, len(texto),
                 )
+
+                if not texto.strip():
+                    log.warning("OCR vazio (doc_id=%d).", doc_id)
+                    self.db.log("ocr_vazio", "AgenteOCR", f"doc_id={doc_id}|conf={conf:.2f}")
+                else:
+                    self.db.inserir_extracao(
+                        documento_id=doc_id,
+                        agente="OCRAgent",
+                        confianca_media=float(conf),
+                        texto_extraido=texto[:200000] + ("..." if len(texto) > 200000 else ""),
+                        linguagem="pt",
+                        tempo_processamento=round(ocr_time, 3),
+                    )
+                    try:
+                        self.db.atualizar_documento_campos(doc_id, ocr_tipo=ocr_tipo)
+                    except Exception:
+                        pass
+
             except Exception as e_ocr:
                 log.error("Falha OCR doc_id %d: %s", doc_id, e_ocr)
                 status_final = "erro"
                 self.db.atualizar_documento_campos(doc_id, status=status_final, motivo_rejeicao=f"Falha OCR: {e_ocr}")
                 self.db.log("ocr_erro", "sistema", f"doc_id={doc_id}|erro={e_ocr}")
                 raise
+
 
             # ---------- NLP (heurística) ----------
             campos_nlp: Dict[str, Any] = {}

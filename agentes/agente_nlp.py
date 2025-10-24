@@ -1,4 +1,4 @@
-# agentes/nlp.py
+# agentes/agente_nlp.py
 
 from __future__ import annotations
 import logging
@@ -12,7 +12,7 @@ from .utils import (
 # ---------------------------------------------------------------------
 # Logger
 # ---------------------------------------------------------------------
-log = logging.getLogger("projeto_fiscal.agentes")
+log = logging.getLogger("agente_fiscal.agentes")
 
 # ---------------------------------------------------------------------
 # Agente NLP

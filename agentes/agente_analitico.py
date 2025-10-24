@@ -1,4 +1,4 @@
-# agentes/analitico.py
+# agentes/agente_analitico.py
 
 from __future__ import annotations
 import builtins
@@ -11,11 +11,10 @@ import pandas as pd
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel  # noqa: F401
-    from memoria import MemoriaSessao  # ajuste o caminho se for diferente
+    from langchain_core.language_models.chat_models import BaseChatModel  
+    from memoria import MemoriaSessao  
 
 try:
-    # LangChain messages (mantido fora de TYPE_CHECKING porque são usados em runtime)
     from langchain_core.messages import SystemMessage, HumanMessage
 except Exception as _e:
     raise ImportError(
@@ -23,7 +22,7 @@ except Exception as _e:
     ) from _e
 
 
-log = logging.getLogger("projeto_fiscal.agentes")
+log = logging.getLogger("agente_fiscal.agentes")
 
 # ------------------------------ Sandbox seguro ------------------------------
 class SecurityException(Exception):
@@ -38,13 +37,12 @@ def _restricted_import(name: str, *args, **kwargs):
         raise SecurityException(f"Importação proibida: {name}")
     return builtins.__import__(name, *args, **kwargs)
 
-# SAFE_BUILTINS final e correto, definido uma vez no nível do módulo.
 SAFE_BUILTINS = {k: getattr(builtins, k) for k in (
     "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
     "len", "list", "max", "min", "print", "range", "round", "set", "sorted",
     "str", "sum", "tuple", "type", "zip",
 )}
-SAFE_BUILTINS["__import__"] = _restricted_import  # Sobrescreve o import padrão
+SAFE_BUILTINS["__import__"] = _restricted_import  
 
 
 # ------------------------------ Agente Analítico ------------------------------
@@ -193,7 +191,7 @@ class AgenteAnalitico:
     # ---------- Execução ----------
     def _executar_sandbox(self, code: str, pergunta: str, catalog: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         scope = {"__builtins__": SAFE_BUILTINS.copy()}
-        scope["__builtins__"]["__import__"] = _restricted_import  # reforça
+        scope["__builtins__"]["__import__"] = _restricted_import  
 
         try:
             exec(code, scope)

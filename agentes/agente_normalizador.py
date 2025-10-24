@@ -1,4 +1,4 @@
-# agentes/normalizador.py
+# agentes/agente_normalizador.py
 
 from __future__ import annotations
 import re

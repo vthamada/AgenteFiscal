@@ -1,4 +1,4 @@
-# agentes/associador.py
+# agentes/agente_associador_xml.py
 
 from __future__ import annotations
 import logging
@@ -6,7 +6,7 @@ import re
 from typing import Any, Dict, Optional 
 from .utils import _only_digits
 
-log = logging.getLogger("projeto_fiscal.agentes")
+log = logging.getLogger("agente_fiscal.agentes")
 
 class AgenteAssociadorXML:
     """
@@ -17,9 +17,8 @@ class AgenteAssociadorXML:
     RE_QR_CHAVE = re.compile(r"(?:chNFe|chCTe)=([0-9]{44})")
     RE_CHAVE_SECA = re.compile(r"\b(\d{44})\b")
 
-    def __init__(self, db: "BancoDeDados", cofre: "Cofre"):
+    def __init__(self, db: "BancoDeDados"):
         self.db = db
-        self.cofre = None 
 
     def _procurar_por_chave(self, chave: Optional[str]) -> Optional[Dict[str, Any]]:
         if not chave:

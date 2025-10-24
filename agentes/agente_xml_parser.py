@@ -1,4 +1,4 @@
-# agentes/xml_parser.py
+# agentes/agente_xml_parser.py
 
 from __future__ import annotations
 import logging
@@ -12,7 +12,7 @@ from .utils import (
 )
 
 # Logger do módulo
-log = logging.getLogger("projeto_fiscal.agentes")
+log = logging.getLogger("agente_fiscal.agentes")
 
 # ---------------------------------------------------------------------------
 # Imports apenas para type hints (evita ciclos em tempo de execução)
@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from banco_de_dados import BancoDeDados
     from validacao import ValidadorFiscal
-    from seguranca import Cofre
     from metrics_agent import MetricsAgent  
 
 # ---------------------------------------------------------------------------
@@ -34,10 +33,9 @@ class AgenteXMLParser:
     criptografa dados sensíveis e popula o banco."""
 
     # -------------------- Inicialização --------------------
-    def __init__(self, db: "BancoDeDados", validador: "ValidadorFiscal", cofre: "Cofre", metrics_agent: "MetricsAgent"):
+    def __init__(self, db: "BancoDeDados", validador: "ValidadorFiscal", metrics_agent: "MetricsAgent"):
         self.db = db
         self.validador = validador
-        self.cofre = cofre
         self.metrics_agent = metrics_agent
 
     # -------------------- Público --------------------
@@ -126,11 +124,10 @@ class AgenteXMLParser:
             if campos.get("valor_total") is None:
                 campos["valor_total"] = self._coalesce_total(root, tipo)
 
-            # Criptografia de CNPJ/CPF (somente dígitos)
+            # Normaliza CNPJ/CPF (mantém apenas dígitos)
             for chave_id in ("emitente_cnpj", "emitente_cpf", "destinatario_cnpj", "destinatario_cpf"):
                 if campos.get(chave_id):
-                    dig = _only_digits(campos[chave_id])
-                    campos[chave_id] = self.cofre.encrypt_text(dig) if dig else None
+                    campos[chave_id] = _only_digits(campos[chave_id])
 
             # 4) Inserção do documento
             doc_id = self.db.inserir_documento(
@@ -198,7 +195,7 @@ class AgenteXMLParser:
                     self.db.log(
                         "ingestao_xml",
                         usuario="sistema",
-                        detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}|crypto={'on' if getattr(self.cofre,'available',False) else 'off'}",
+                        detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}",
                     )
                 finally:
                     self.metrics_agent.registrar_metrica(
@@ -763,7 +760,7 @@ class AgenteXMLParser:
                 self.db.log(
                     "ingestao_xml",
                     usuario="sistema",
-                    detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}|crypto={'on' if getattr(self.cofre,'available',False) else 'off'}",
+                    detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}",
                 )
                 self.metrics_agent.registrar_metrica(
                     db=self.db,
