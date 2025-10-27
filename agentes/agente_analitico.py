@@ -1,123 +1,212 @@
 # agentes/agente_analitico.py
-
 from __future__ import annotations
 import builtins
+import io
 import logging
 import re
 import time
 import traceback
-from typing import Any, Dict
+from contextlib import redirect_stdout
+from typing import Any, Dict, TYPE_CHECKING
+
 import pandas as pd
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel  
-    from memoria import MemoriaSessao  
+    from langchain_core.language_models.chat_models import BaseChatModel
+    from memoria import MemoriaSessao
 
 try:
     from langchain_core.messages import SystemMessage, HumanMessage
 except Exception as _e:
     raise ImportError(
-        "agentes/analitico.py requer langchain-core instalado: `pip install langchain-core`"
+        "agentes/agente_analitico.py requer langchain-core instalado: `pip install langchain-core`"
     ) from _e
 
 
 log = logging.getLogger("agente_fiscal.agentes")
 
-# ------------------------------ Sandbox seguro ------------------------------
+# =============================================================================
+# Sandbox / Segurança
+# =============================================================================
 class SecurityException(Exception):
-    pass
+    """Erro de segurança: tentativa de uso de recurso proibido no sandbox."""
 
+
+# OBS: Estes são módulos que permitimos o *código gerado* importar.
+# O próprio agente (este arquivo) pode importar o que precisar,
+# mas a função `solve` gerada pela LLM só poderá importar estes:
 ALLOWED_IMPORTS = {"pandas", "numpy", "matplotlib", "plotly", "traceback"}
 
 def _restricted_import(name: str, *args, **kwargs):
-    """Função de import restrita para o sandbox."""
-    root_module = name.split(".")[0]
+    """Hook de import para o código do usuário (solve).
+    Bloqueia qualquer import fora da whitelist ALLOWED_IMPORTS.
+    """
+    root_module = (name or "").split(".")[0]
     if root_module not in ALLOWED_IMPORTS:
-        raise SecurityException(f"Importação proibida: {name}")
+        raise SecurityException(f"Importação proibida no sandbox: {name}")
     return builtins.__import__(name, *args, **kwargs)
 
-SAFE_BUILTINS = {k: getattr(builtins, k) for k in (
-    "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
-    "len", "list", "max", "min", "print", "range", "round", "set", "sorted",
-    "str", "sum", "tuple", "type", "zip",
-)}
-SAFE_BUILTINS["__import__"] = _restricted_import  
+
+# Conjunto de builtins seguros expostos ao código do usuário
+SAFE_BUILTINS = {
+    k: getattr(builtins, k)
+    for k in (
+        "abs", "all", "any", "bool", "dict", "enumerate", "float", "int", "isinstance",
+        "len", "list", "max", "min", "print", "range", "round", "set", "sorted",
+        "str", "sum", "tuple", "type", "zip",
+    )
+}
+# Substitui o import por nossa função restrita
+SAFE_BUILTINS["__import__"] = _restricted_import
 
 
-# ------------------------------ Agente Analítico ------------------------------
+# Limites defensivos para as saídas de tabela
+MAX_DF_ROWS = 5000
+MAX_DF_COLS = 50
+
+
+def _sanitize_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Garante que a tabela retornada pelo solve não exploda o front.
+    - Mantém no máximo MAX_DF_ROWS linhas e MAX_DF_COLS colunas.
+    - Converte tipos problemáticos de forma passiva (sem alterar semântica).
+    """
+    if df is None:
+        return None
+    try:
+        if not isinstance(df, pd.DataFrame):
+            return None
+        # recortes
+        if df.shape[0] > MAX_DF_ROWS:
+            df = df.head(MAX_DF_ROWS).copy()
+        if df.shape[1] > MAX_DF_COLS:
+            df = df.iloc[:, :MAX_DF_COLS].copy()
+        # nomes seguros (evita colunas sem nome)
+        df.columns = [str(c) if (c is not None and c != "") else f"col_{i}" for i, c in enumerate(df.columns)]
+        return df
+    except Exception as e:
+        log.debug(f"_sanitize_df falhou: {e}")
+        return None
+
+
+def _extract_function_code(raw: str) -> str:
+    """Extrai de forma robusta a função `solve(catalog, question)` do texto do LLM.
+    Aceita:
+      - bloco ```python ... ```
+      - resposta sem cercas, contendo apenas a função
+    """
+    if not raw:
+        return ""
+
+    # 1) Preferência: bloco ```python ... ```
+    m = re.search(r"```python\s*(.*?)```", raw, flags=re.S | re.I)
+    if m:
+        snippet = m.group(1).strip()
+        # pode vir explicação antes, então capture a partir do def
+        mdef = re.search(r"(def\s+solve\s*\(\s*catalog\s*,\s*question\s*\)\s*:.*)", snippet, flags=re.S)
+        if mdef:
+            return mdef.group(1).strip()
+        return snippet
+
+    # 2) Fallback: localizar def solve direto no texto
+    m2 = re.search(r"(def\s+solve\s*\(\s*catalog\s*,\s*question\s*\)\s*:.*)", raw, flags=re.S)
+    if m2:
+        return m2.group(1).strip()
+
+    return ""
+
+# =============================================================================
+# Agente Analítico
+# =============================================================================
 class AgenteAnalitico:
-    """Gera e executa código Python via LLM com auto-correção."""
+    """Gera e executa código Python via LLM, em sandbox restrito, com auto-correção."""
 
     def __init__(self, llm: "BaseChatModel", memoria: "MemoriaSessao"):
         self.llm = llm
         self.memoria = memoria
-        self.last_code: str = ""  # Armazena o último código tentado
+        self.last_code: str = ""     # último código gerado/corrigido
+        self.last_error: str = ""    # último erro (para depuração)
 
-    # ---------- Prompting ----------
+    # --------------------------- Prompting ---------------------------------
     def _prompt_inicial(self, catalog: Dict[str, pd.DataFrame]) -> SystemMessage:
-        """Constrói o prompt inicial para a geração de código (Código Completo)."""
-        schema_lines = []
-        example_table_name = 'documentos' if 'documentos' in catalog else next(iter(catalog.keys()), 'tabela_exemplo')
-
-        for t, df in catalog.items():
-            schema_lines.append(f"- Tabela `{t}` ({df.shape[0]} linhas): Colunas: `{', '.join(map(str, df.columns))}`")
+        """Prompt-base para a *geração* da função `solve`."""
+        schema_lines: list[str] = []
+        if catalog:
+            for t, df in catalog.items():
+                try:
+                    schema_lines.append(
+                        f"- Tabela `{t}` ({df.shape[0]} linhas): Colunas: `{', '.join(map(str, df.columns))}`"
+                    )
+                except Exception:
+                    schema_lines.append(f"- Tabela `{t}` (meta indisponível)")
         schema = "\n".join(schema_lines) or "- (Nenhum dado carregado)"
-        history = self.memoria.resumo()
+        history = ""
+        try:
+            history = self.memoria.resumo()
+        except Exception:
+            pass
 
         prompt = f"""
-        Você é um agente de análise de dados de elite expert em Python. Sua tarefa é gerar código Python robusto e bem formatado para uma função 'solve'.
+        Você é um agente de análise de dados de elite, expert em **Python + Pandas**. Gere **APENAS** a função `solve(catalog, question)`,
+        com código completo e executável no **sandbox**. Siga à risca:
 
-        **REGRAS CRÍTICAS DE EXECUÇÃO:**
-        1.  **CRÍTICO:** Todas as declarações de `import` DEVEM estar DENTRO da função `solve`.
-        2.  Imports permitidos: {', '.join(ALLOWED_IMPORTS)}. NENHUM OUTRO será permitido pelo sandbox.
-        3.  Use APENAS funções built-in seguras. O sandbox bloqueará outras. Funções como `open()`, `eval()`, `exec()` são PROIBIDAS.
-        4.  Acesse dados via `catalog['nome_tabela']`. **SEMPRE** use `.copy()` ao pegar um DataFrame do catalog (ex: `df = catalog['documentos'].copy()`).
-        5.  Retorne uma tupla: `(texto: str, tabela: pd.DataFrame | None, figura: plt.Figure | go.Figure | None)`.
-        6.  Seja DEFENSIVO: Use `pd.to_numeric(df['coluna'], errors='coerce')` para conversões numéricas. Use `.fillna(0)` ou `.dropna()` apropriadamente. Verifique se as colunas existem antes de usá-las (`if 'coluna' in df.columns:`).
-        7.  GRÁFICOS: Prefira `plotly.express as px`. Use `fig.update_layout(width=800, height=500)` para ajustar o tamanho. Para `matplotlib.pyplot as plt`, use `fig, ax = plt.subplots(figsize=(10, 6))` e `plt.tight_layout()` antes de retornar `fig`.
-        8.  Se retornar uma `tabela` (DataFrame), o `texto` deve ser um resumo ou título, NÃO a tabela convertida para string (`.to_string()`).
-        9.  Manipule datas com `pd.to_datetime(df['coluna_data'], errors='coerce')`.
+        REGRAS CRÍTICAS DO SANDBOX
+        1) **Todos os imports** DEVEM ficar **dentro** da função `solve`.
+        2) Imports permitidos: {', '.join(sorted(ALLOWED_IMPORTS))}. Qualquer outro causará bloqueio.
+        3) Não use `open`, `eval`, `exec`, `os`, `sys`, `subprocess`, `pathlib`, `pickle`, `requests`, nem I/O de arquivos.
+        4) Acesse dados pelo `catalog['tabela']` e chame **sempre** `.copy()` antes de manipular.
+        5) Retorne exatamente: `(texto: str, tabela: pd.DataFrame | None, figura: plt.Figure | go.Figure | None)`.
+        6) Seja **defensivo**:
+        - Verifique colunas: `if 'col' in df.columns: ...`
+        - Converta numéricos: `pd.to_numeric(df['col'], errors='coerce')`
+        - Datas: `pd.to_datetime(df['data'], errors='coerce')`
+        - Trate `NaN` adequadamente.
+        7) Gráficos:
+        - Preferir `plotly.express as px` ou `plotly.graph_objects as go`.
+        - Opcionalmente `matplotlib.pyplot as plt` (use `fig, ax = plt.subplots(figsize=(10,6))` e `plt.tight_layout()`).
+        - Não use seaborn.
+        8) O texto deve **resumir o resultado**. Não converta DataFrame para string.
+        9) A tabela retornada poderá ser truncada pelo host (máx. {MAX_DF_ROWS} linhas / {MAX_DF_COLS} colunas).
+        10) Não altere o estado global, não defina *threads*, *processes* ou *sockets*.
 
-        **ESQUEMA DISPONÍVEL:**
+        ESQUEMA DISPONÍVEL
         {schema}
 
-        **HISTÓRICO RECENTE (para contexto):**
+        HISTÓRICO (contexto resumido)
         {history}
 
-        **ESTRUTURA OBRIGATÓRIA DA FUNÇÃO:**
+        ESTRUTURA OBRIGATÓRIA
         ```python
         def solve(catalog, question):
-            # Imports AQUI dentro da função
+            # imports DENTRO da função
             import pandas as pd
             import numpy as np
             import matplotlib.pyplot as plt
             import plotly.express as px
             import plotly.graph_objects as go
 
-            # Variáveis de resultado padrão
             text_output = "Análise não pôde ser concluída."
             table_output = None
             figure_output = None
 
-            # Exemplo de acesso seguro aos dados
-            if '{example_table_name}' in catalog:
-                df = catalog['{example_table_name}'].copy()
-            else:
-                 return ("Tabela '{example_table_name}' não encontrada no catálogo.", None, None)
+            # Exemplo de acesso seguro
+            if len(catalog) == 0:
+                return ("Não há tabelas no catálogo.", None, None)
 
-            # --- SEU CÓDIGO ROBUSTO DE ANÁLISE VEM AQUI ---
+            # Escolha uma tabela relevante com validação:
+            first_tbl = next(iter(catalog.keys()))
+            df = catalog[first_tbl].copy()
+
             try:
-                # Ex.: df['valor_total'] = pd.to_numeric(df['valor_total'], errors='coerce').fillna(0)
-                text_output = "# Título da Análise\\nDescrição dos resultados..."
+                # seu código robusto aqui...
+                text_output = "# Título\\nResumo curto e objetivo."
                 # table_output = df_resultado
                 # figure_output = fig
             except Exception as e:
                 import traceback
-                error_details = traceback.format_exc(limit=1)
-                text_output = f"Erro durante a análise: {{type(e).__name__}}: {{e}}\\nDetalhe: ...{{error_details.splitlines()[-1]}}"
+                text_output = f"Erro durante a análise: {{type(e).__name__}}: {{e}}\\n" + traceback.format_exc(limit=1)
 
             return (text_output, table_output, figure_output)
+
         ```
         Gere APENAS o código Python completo da função `solve`, nada antes ou depois.
         """
@@ -149,167 +238,179 @@ class AgenteAnalitico:
         """
         return SystemMessage(content=prompt.strip())
 
-    # ---------- Geração / Correção ----------
+    # --------------------- Geração / Correção via LLM -----------------------
     def _gerar_codigo(self, pergunta: str, catalog: Dict[str, pd.DataFrame]) -> str:
         sys = self._prompt_inicial(catalog)
         hum = HumanMessage(content=f"Pergunta do usuário: {pergunta}")
+        resp_text = ""
         try:
-            resp = self.llm.invoke([sys, hum]).content.strip()
-            code_match = re.search(r"```python\n(.*?)\n```", resp, re.DOTALL)
-            if code_match:
-                code = code_match.group(1).strip()
-            else:
-                log.warning("LLM não retornou bloco ```python```. Tentando usar a resposta inteira.")
-                code = resp.strip()
-                if not code.startswith("def solve(catalog, question):"):
-                    raise ValueError("Resposta do LLM não parece conter a função 'solve'.")
+            resp_text = self.llm.invoke([sys, hum]).content or ""
+            code = _extract_function_code(resp_text.strip())
+            if not code or not code.lstrip().startswith("def solve("):
+                raise ValueError("A resposta do LLM não contém a função `solve` válida.")
             self.last_code = code
             return code
         except Exception as e:
             log.error(f"Erro ao invocar LLM para gerar código: {e}")
-            raise RuntimeError(f"Falha na comunicação com LLM: {e}") from e
+            raise RuntimeError(f"Falha na geração de código com LLM: {e}\nResposta do LLM:\n{resp_text}") from e
 
     def _corrigir_codigo(self, failed_code: str, erro: str) -> str:
         sys = self._prompt_correcao(failed_code, erro)
-        hum = HumanMessage(content="Por favor, corrija a função `solve` baseada no erro e no código fornecido.")
+        hum = HumanMessage(content="Corrija a função `solve` conforme instruções.")
+        resp_text = ""
         try:
-            resp = self.llm.invoke([sys, hum]).content.strip()
-            code_match = re.search(r"```python\n(.*?)\n```", resp, re.DOTALL)
-            if code_match:
-                code = code_match.group(1).strip()
-            else:
-                log.warning("LLM não retornou bloco ```python``` na CORREÇÃO. Usando resposta inteira.")
-                code = resp.strip()
-                if not code.startswith("def solve(catalog, question):"):
-                    raise ValueError("Correção do LLM não parece conter a função 'solve'.")
+            resp_text = self.llm.invoke([sys, hum]).content or ""
+            code = _extract_function_code(resp_text.strip())
+            if not code or not code.lstrip().startswith("def solve("):
+                raise ValueError("A correção do LLM não contém a função `solve` válida.")
             self.last_code = code
             return code
         except Exception as e:
             log.error(f"Erro ao invocar LLM para corrigir código: {e}")
-            raise RuntimeError(f"Falha na comunicação com LLM durante correção: {e}") from e
+            raise RuntimeError(f"Falha na correção com LLM: {e}\nResposta do LLM:\n{resp_text}") from e
 
-    # ---------- Execução ----------
+    # ------------------------------ Execução --------------------------------
     def _executar_sandbox(self, code: str, pergunta: str, catalog: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-        scope = {"__builtins__": SAFE_BUILTINS.copy()}
-        scope["__builtins__"]["__import__"] = _restricted_import  
+        """Compila/executa o código gerado em escopo controlado e retorna as saídas normalizadas."""
+        # Escopo isolado com builtins restritos
+        scope: Dict[str, Any] = {"__builtins__": SAFE_BUILTINS.copy()}
 
+        # 1) Compilar/registrar a função `solve`
         try:
             exec(code, scope)
         except SecurityException as se:
             log.error(f"Tentativa de execução insegura bloqueada: {se}")
-            raise se
+            raise
         except Exception as e_comp:
-            log.error(f"Erro de compilação/execução do código gerado:\n{code}\nErro: {e_comp}")
-            raise SyntaxError(f"Erro ao executar código gerado: {e_comp}") from e_comp
+            log.error(f"Erro de compilação no código gerado:\n{code}\nErro: {e_comp}")
+            raise SyntaxError(f"Erro de compilação do código gerado: {e_comp}") from e_comp
 
         if "solve" not in scope or not callable(scope["solve"]):
-            raise RuntimeError("A função `solve` não foi definida corretamente no código gerado.")
+            raise RuntimeError("A função `solve` não foi definida corretamente pelo LLM.")
 
         solve_fn = scope["solve"]
-        t0 = time.time()
+
+        # 2) Executar `solve` capturando stdout para anexar ao texto
+        start_ts = time.time()
+        stdout_buf = io.StringIO()
         try:
-            texto, tabela, fig = solve_fn({k: v for k, v in catalog.items()}, pergunta)
+            with redirect_stdout(stdout_buf):
+                texto, tabela, fig = solve_fn({k: v for k, v in catalog.items()}, pergunta)
         except Exception as e_runtime:
-            log.error(f"Erro durante a execução de 'solve':\n{code}\nErro: {e_runtime}")
             tb_str = traceback.format_exc(limit=3)
-            raise RuntimeError(f"Erro na execução da lógica de 'solve': {e_runtime}\n{tb_str}") from e_runtime
+            self.last_error = f"{type(e_runtime).__name__}: {e_runtime}\n{tb_str}"
+            log.error(f"Erro durante a execução de solve:\n{self.last_error}")
+            raise RuntimeError(f"Erro na execução de 'solve': {e_runtime}\n{tb_str}") from e_runtime
+        finally:
+            duration = round(time.time() - start_ts, 3)
 
-        dt = time.time() - t0
-
-        # Normalização dos retornos
+        # 3) Normalizações das saídas
+        # 3.1 texto
         if not isinstance(texto, str):
-            log.warning(f"'texto' não é string ({type(texto)}). Convertendo para str.")
+            log.warning(f"'texto' não é str ({type(texto)}). Convertendo para str.")
             texto = str(texto)
-        if tabela is not None and not isinstance(tabela, pd.DataFrame):
-            log.warning(f"'tabela' não é DataFrame/None ({type(tabela)}). Ignorando tabela.")
-            tabela = None
+        # anexa stdout se houver conteúdo útil
+        captured = stdout_buf.getvalue().strip()
+        if captured:
+            texto = f"{texto.rstrip()}\n\n--- stdout ---\n{captured}"
+
+        # 3.2 tabela
+        tabela = _sanitize_df(tabela)
+
+        # 3.3 figura (validação leve para matplotlib/plotly)
         if fig is not None:
-            # valida de forma defensiva sem depender estático de libs
             try:
                 import importlib
-                matplotlib_figure = None
+                is_ok = False
                 try:
-                    matplotlib_figure = importlib.import_module("matplotlib.figure")
+                    mf = importlib.import_module("matplotlib.figure")
+                    if isinstance(fig, getattr(mf, "Figure")):
+                        is_ok = True
                 except Exception:
                     pass
-                go = None
                 try:
                     go = importlib.import_module("plotly.graph_objects")
+                    if isinstance(fig, getattr(go, "Figure")):
+                        is_ok = True
                 except Exception:
                     pass
-
-                is_matplotlib_fig = bool(matplotlib_figure) and isinstance(fig, getattr(matplotlib_figure, "Figure"))
-                is_plotly_fig = bool(go) and isinstance(fig, getattr(go, "Figure"))
-                if not (is_matplotlib_fig or is_plotly_fig):
-                    log.warning(f"'figura' não reconhecida: {type(fig)}. Removendo.")
+                if not is_ok:
+                    log.warning(f"'fig' não reconhecida ({type(fig)}). Será descartada.")
                     fig = None
             except Exception:
-                log.warning("Não foi possível validar a figura (libs gráficas ausentes).")
                 fig = None
 
         return {
             "texto": texto,
             "tabela": tabela,
             "figuras": [fig] if fig is not None else [],
-            "duracao_s": round(dt, 3),
+            "duracao_s": duration,
             "code": code,
         }
 
-    # ---------- Orquestração ----------
+    # ------------------------------ Orquestração -----------------------------
     def responder(self, pergunta: str, catalog: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-        """Gera, executa e tenta auto-corrigir o código até 3 tentativas."""
+        """Gera, executa e tenta auto-corrigir o código até 3 tentativas (1 geração + 2 correções)."""
         max_retries = 2
         code_to_run = ""
         try:
+            # 1) Geração inicial
             code_to_run = self._gerar_codigo(pergunta, catalog)
             if not code_to_run.strip():
                 raise ValueError("LLM não gerou nenhum código.")
+
+            # 2) Tentativas de execução + correção
             for attempt in range(max_retries + 1):
                 try:
-                    log.info(f"Tentativa {attempt + 1} de executar código para: '{pergunta[:50]}...'")
+                    log.info(f"[AgenteAnalitico] Execução tentativa {attempt + 1} para: '{pergunta[:60]}...'")
                     out = self._executar_sandbox(code_to_run, pergunta, catalog)
-                    # registra memória
+
+                    # memória (best-effort)
                     try:
                         self.memoria.salvar(pergunta, out.get("texto", ""), duracao_s=out.get("duracao_s", 0.0))
                     except Exception:
                         log.debug("Falha ao salvar memória (ignorado).")
+
                     out["agent_name"] = f"AgenteAnalitico (Tentativa {attempt + 1})"
-                    out["summary"] = f"Executou código com sucesso para: '{pergunta[:50]}...'"
-                    log.info(f"Execução bem-sucedida na tentativa {attempt + 1}.")
+                    out["summary"] = f"Código executado com sucesso."
                     return out
-                except (SyntaxError, SecurityException, RuntimeError, TypeError, ValueError, KeyError, IndexError, AttributeError) as e1:
-                    error_message = f"{type(e1).__name__}: {e1}"
-                    log.warning(f"Falha na tentativa {attempt + 1}: {error_message}")
+
+                except (SecurityException, SyntaxError, RuntimeError, TypeError, ValueError, KeyError, IndexError, AttributeError) as e1:
+                    err_msg = f"{type(e1).__name__}: {e1}"
+                    self.last_error = err_msg
+                    log.warning(f"[AgenteAnalitico] Falha na tentativa {attempt + 1}: {err_msg}")
+
                     if attempt < max_retries:
-                        log.info(f"Solicitando correção ao LLM (tentativa {attempt + 2}/{max_retries + 1}).")
+                        # solicitar correção
                         try:
-                            code_to_run = self._corrigir_codigo(code_to_run, error_message)
+                            code_to_run = self._corrigir_codigo(code_to_run, err_msg)
                             if not code_to_run.strip():
-                                raise ValueError("LLM não gerou nenhum código de correção.")
+                                raise ValueError("LLM não gerou correção de código.")
                         except Exception as e_corr:
-                            log.error(f"Erro ao obter correção do LLM: {e_corr}")
+                            log.error(f"Falha ao obter correção do LLM: {e_corr}")
                             raise RuntimeError("Falha ao obter correção do LLM.") from e_corr
                     else:
-                        log.error("Número máximo de tentativas excedido. Falha final.")
+                        # estourou o limite de tentativas
                         raise
+
         except Exception as e_final:
-            log.error(f"Falha irrecuperável no AgenteAnalitico: {type(e_final).__name__}: {e_final}")
+            log.error(f"[AgenteAnalitico] Falha irrecuperável: {type(e_final).__name__}: {e_final}")
             try:
                 self.memoria.salvar(pergunta, f"Erro: {type(e_final).__name__}: {e_final}", duracao_s=0.0)
             except Exception:
                 pass
+
             return {
                 "texto": (
-                    f"Ocorreu um erro irrecuperável ao tentar analisar sua pergunta após {max_retries + 1} "
-                    f"tentativas. Detalhe: {type(e_final).__name__}: {e_final}"
+                    f"Ocorreu um erro irrecuperável ao tentar analisar sua pergunta: "
+                    f"{type(e_final).__name__}: {e_final}"
                 ),
                 "tabela": None,
                 "figuras": [],
                 "duracao_s": 0.0,
                 "code": self.last_code or code_to_run or "",
                 "agent_name": "AgenteAnalitico (Falha Irrecuperável)",
-                "summary": f"Falha final na geração ou auto-correção para: '{pergunta[:50]}...'",
+                "summary": f"Falha final na geração/correção para: '{pergunta[:60]}...'",
             }
-
 
 __all__ = ["AgenteAnalitico", "SecurityException", "ALLOWED_IMPORTS", "SAFE_BUILTINS"]

@@ -1,7 +1,7 @@
 # banco_de_dados.py
 
 from __future__ import annotations
-from typing import Optional, Dict, Any, Iterable
+from typing import Optional, Dict, Any, Iterable, List, Tuple
 from pathlib import Path
 import sqlite3
 import hashlib
@@ -28,7 +28,7 @@ def _utcnow_iso() -> str:
 class BancoDeDados:
     """
     Camada de persistência (SQLite) com schema completo, índices e migração automática.
-    Compatível com agentes.py, validacao.py e testes integrados.
+    Compatível com agentes.py, validacao.py, orchestrator e testes integrados.
     """
 
     def __init__(self, db_path: Path = DB_PATH):
@@ -76,47 +76,113 @@ class BancoDeDados:
     def _criar_schema(self) -> None:
         cur = self.conn.cursor()
 
-        # DOCUMENTOS
+        # DOCUMENTOS (campos universais + agregados p/ filtros e dashboards)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS documentos (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome_arquivo        TEXT NOT NULL,
-            tipo                TEXT,                 -- NFe, NFCe, CTe, CF-e, pdf, jpg...
-            origem              TEXT,                 -- upload, web, reprocessamento...
-            hash                TEXT UNIQUE,          -- sha256 do arquivo
-            chave_acesso        TEXT,                 -- para NFe/CTe quando existir
-            status              TEXT,                 -- processando, processado, revisao_pendente, revisado, erro, quarentena
-            data_upload         TEXT,                 -- ISO UTC
-            data_emissao        TEXT,                 -- YYYY-MM-DD
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome_arquivo            TEXT NOT NULL,
+            tipo                    TEXT,                 -- NFe, NFCe, CTe, NFSe, pdf, jpg...
+            origem                  TEXT,                 -- upload, web, reprocessamento...
+            hash                    TEXT UNIQUE,          -- sha256 do arquivo
+            chave_acesso            TEXT,                 -- para NFe/CTe quando existir
+
+            status                  TEXT,                 -- processando, processado, revisao_pendente, revisado, erro, quarentena
+            data_upload             TEXT,                 -- ISO UTC
+            data_emissao            TEXT,                 -- YYYY-MM-DD
 
             -- Identificação do emitente/destinatário (podem estar criptografados)
-            emitente_cnpj       TEXT,
-            emitente_cpf        TEXT,
-            emitente_nome       TEXT,
-            destinatario_cnpj   TEXT,
-            destinatario_cpf    TEXT,
-            destinatario_nome   TEXT,
+            emitente_cnpj           TEXT,
+            emitente_cpf            TEXT,
+            emitente_nome           TEXT,
+            destinatario_cnpj       TEXT,
+            destinatario_cpf        TEXT,
+            destinatario_nome       TEXT,
 
-            -- Metadados básicos para filtros rápidos
-            inscricao_estadual  TEXT,
-            uf                  TEXT,
-            municipio           TEXT,
-            endereco            TEXT,                 
+            -- Detalhes universais adicionais (fixos) de emitente/destinatário
+            emitente_ie             TEXT,
+            emitente_im             TEXT,
+            emitente_uf             TEXT,
+            emitente_municipio      TEXT,
+            emitente_endereco       TEXT,
+
+            destinatario_ie         TEXT,
+            destinatario_im         TEXT,
+            destinatario_uf         TEXT,
+            destinatario_municipio  TEXT,
+            destinatario_endereco   TEXT,
+
+            -- Metadados básicos para filtros rápidos (documento)
+            inscricao_estadual      TEXT,
+            uf                      TEXT,
+            municipio               TEXT,
+            endereco                TEXT,
+
+            -- Identificação fiscal adicional
+            numero_nota             TEXT,
+            serie                   TEXT,
+            modelo                  TEXT,
 
             -- Totais de nota (quando disponíveis)
-            valor_total         REAL,
-            total_produtos      REAL,
-            total_servicos      REAL,
+            valor_total             REAL,
+            total_produtos          REAL,
+            total_servicos          REAL,
 
-            -- Totais de impostos agregados (opcionais; úteis para relatórios)
-            total_icms          REAL,
-            total_ipi           REAL,
-            total_pis           REAL,
-            total_cofins        REAL,
+            -- Totais complementares (XML/NLP)
+            valor_descontos         REAL,
+            valor_frete             REAL,
+            valor_seguro            REAL,
+            valor_outros            REAL,
+            valor_liquido           REAL,
 
-            caminho_arquivo     TEXT,
-            motivo_rejeicao     TEXT,
-            meta_json           TEXT                  
+            -- Totais de impostos agregados
+            total_icms              REAL,
+            total_ipi               REAL,
+            total_pis               REAL,
+            total_cofins            REAL,
+
+            -- Transporte (universais)
+            modalidade_frete        TEXT,
+            placa_veiculo           TEXT,
+            uf_veiculo              TEXT,
+            peso_bruto              REAL,
+            peso_liquido            REAL,
+            qtd_volumes             REAL,
+
+            -- Pagamento (universais)
+            forma_pagamento         TEXT,
+            valor_pagamento         REAL,
+            troco                   REAL,
+
+            -- Dados específicos de XML e autorização
+            caminho_arquivo         TEXT,                 -- caminho do arquivo original (PDF/imagem)
+            caminho_xml             TEXT,                 -- caminho do XML (se houver)
+            versao_schema           TEXT,                 -- ex.: 4.00
+            ambiente                TEXT,                 -- 1=produção, 2=homologação
+            protocolo_autorizacao   TEXT,                 -- nProt
+            data_autorizacao        TEXT,                 -- dhRecbto
+            cstat                   TEXT,                 -- código de status
+            xmotivo                 TEXT,                 -- descrição do status
+            responsavel_tecnico     TEXT,
+
+            -- Telemetria de OCR
+            ocr_tipo                TEXT,                 -- 'nativo' | 'ocr' | null
+
+            motivo_rejeicao         TEXT,
+            meta_json               TEXT
+        )
+        """)
+
+        # NOVA: DETALHES DINÂMICOS (key-value) – garante evolução sem migração de schema
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS documentos_detalhes (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            documento_id    INTEGER NOT NULL,
+            chave           TEXT NOT NULL,   -- ex.: 'emit/enderEmit/xLgr', 'dest/enderDest/CEP', 'vFCPST'
+            valor           TEXT,            -- armazenado como TEXT; conversão na aplicação
+            origem          TEXT,            -- xml_parser, ocr_nlp, revisao, integracao, etc.
+            criado_em       TEXT DEFAULT (datetime('now')),
+            UNIQUE(documento_id, chave),
+            FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
         )
         """)
 
@@ -125,7 +191,7 @@ class BancoDeDados:
         CREATE TABLE IF NOT EXISTS itens (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             documento_id    INTEGER NOT NULL,
-            numero_item     INTEGER,     
+            numero_item     INTEGER,
             descricao       TEXT,
             ean             TEXT,
             ncm             TEXT,
@@ -238,21 +304,32 @@ class BancoDeDados:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_tipo ON documentos(tipo)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_uf ON documentos(uf)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_data_emissao ON documentos(data_emissao)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_num_serie ON documentos(numero_nota, serie)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_chave ON documentos(chave_acesso)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_emit_cnpj ON documentos(emitente_cnpj)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_dest_cnpj ON documentos(destinatario_cnpj)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_itens_doc ON itens(documento_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_impostos_item ON impostos(item_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_docdet_doc ON documentos_detalhes(documento_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_docdet_chave ON documentos_detalhes(chave)")
 
         self.conn.commit()
 
     # ------------------------- Migração/Auto-fix do schema -------------------------
     def _migrar_schema_se_preciso(self) -> None:
         """
-        Verifica e adiciona colunas que podem faltar em bancos criados antes.
-        Não remove nem renomeia automaticamente (operações destrutivas).
+        Verifica e adiciona colunas/tabelas que podem faltar em bancos antigos.
+        Não remove/renomeia automaticamente (operações destrutivas).
         """
         def _colunas(tabela: str) -> set[str]:
             cur = self.conn.cursor()
             cur.execute(f"PRAGMA table_info({tabela})")
             return {row[1] for row in cur.fetchall()}
+
+        def _tabelas() -> set[str]:
+            cur = self.conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            return {r[0] for r in cur.fetchall()}
 
         def _add_col_if_missing(tabela: str, coluna: str, decl: str) -> None:
             existentes = _colunas(tabela)
@@ -260,17 +337,89 @@ class BancoDeDados:
                 self.conn.execute(f"ALTER TABLE {tabela} ADD COLUMN {decl}")
                 self.conn.commit()
 
-        # documentos: garantir campos usados por OCR/NLP/Validação
+        tabs = _tabelas()
+
+        # Garante documentos_detalhes em bases antigas
+        if "documentos_detalhes" not in tabs:
+            self.conn.execute("""
+            CREATE TABLE documentos_detalhes (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                documento_id    INTEGER NOT NULL,
+                chave           TEXT NOT NULL,
+                valor           TEXT,
+                origem          TEXT,
+                criado_em       TEXT DEFAULT (datetime('now')),
+                UNIQUE(documento_id, chave),
+                FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
+            )
+            """)
+            self.conn.execute("CREATE INDEX IF NOT EXISTS ix_docdet_doc ON documentos_detalhes(documento_id)")
+            self.conn.execute("CREATE INDEX IF NOT EXISTS ix_docdet_chave ON documentos_detalhes(chave)")
+            self.conn.commit()
+
+        # documentos: garantir campos universais usados por OCR/NLP/Validação + XML
         _add_col_if_missing("documentos", "endereco", "endereco TEXT")
         _add_col_if_missing("documentos", "meta_json", "meta_json TEXT")
         _add_col_if_missing("documentos", "chave_acesso", "chave_acesso TEXT")
         _add_col_if_missing("documentos", "motivo_rejeicao", "motivo_rejeicao TEXT")
+
+        # totais impostos e produtos/serviços
         _add_col_if_missing("documentos", "total_icms", "total_icms REAL")
         _add_col_if_missing("documentos", "total_ipi", "total_ipi REAL")
         _add_col_if_missing("documentos", "total_pis", "total_pis REAL")
         _add_col_if_missing("documentos", "total_cofins", "total_cofins REAL")
         _add_col_if_missing("documentos", "total_produtos", "total_produtos REAL")
         _add_col_if_missing("documentos", "total_servicos", "total_servicos REAL")
+
+        # novos campos fiscal/identificação
+        _add_col_if_missing("documentos", "numero_nota", "numero_nota TEXT")
+        _add_col_if_missing("documentos", "serie", "serie TEXT")
+        _add_col_if_missing("documentos", "modelo", "modelo TEXT")
+
+        # detalhamento emitente/destinatário
+        _add_col_if_missing("documentos", "emitente_ie", "emitente_ie TEXT")
+        _add_col_if_missing("documentos", "emitente_im", "emitente_im TEXT")
+        _add_col_if_missing("documentos", "emitente_uf", "emitente_uf TEXT")
+        _add_col_if_missing("documentos", "emitente_municipio", "emitente_municipio TEXT")
+        _add_col_if_missing("documentos", "emitente_endereco", "emitente_endereco TEXT")
+        _add_col_if_missing("documentos", "destinatario_ie", "destinatario_ie TEXT")
+        _add_col_if_missing("documentos", "destinatario_im", "destinatario_im TEXT")
+        _add_col_if_missing("documentos", "destinatario_uf", "destinatario_uf TEXT")
+        _add_col_if_missing("documentos", "destinatario_municipio", "destinatario_municipio TEXT")
+        _add_col_if_missing("documentos", "destinatario_endereco", "destinatario_endereco TEXT")
+
+        # totais complementares
+        _add_col_if_missing("documentos", "valor_descontos", "valor_descontos REAL")
+        _add_col_if_missing("documentos", "valor_frete", "valor_frete REAL")
+        _add_col_if_missing("documentos", "valor_seguro", "valor_seguro REAL")
+        _add_col_if_missing("documentos", "valor_outros", "valor_outros REAL")
+        _add_col_if_missing("documentos", "valor_liquido", "valor_liquido REAL")
+
+        # transporte universais
+        _add_col_if_missing("documentos", "modalidade_frete", "modalidade_frete TEXT")
+        _add_col_if_missing("documentos", "placa_veiculo", "placa_veiculo TEXT")
+        _add_col_if_missing("documentos", "uf_veiculo", "uf_veiculo TEXT")
+        _add_col_if_missing("documentos", "peso_bruto", "peso_bruto REAL")
+        _add_col_if_missing("documentos", "peso_liquido", "peso_liquido REAL")
+        _add_col_if_missing("documentos", "qtd_volumes", "qtd_volumes REAL")
+
+        # pagamento universais
+        _add_col_if_missing("documentos", "forma_pagamento", "forma_pagamento TEXT")
+        _add_col_if_missing("documentos", "valor_pagamento", "valor_pagamento REAL")
+        _add_col_if_missing("documentos", "troco", "troco REAL")
+
+        # metadados XML/autorização
+        _add_col_if_missing("documentos", "caminho_xml", "caminho_xml TEXT")
+        _add_col_if_missing("documentos", "versao_schema", "versao_schema TEXT")
+        _add_col_if_missing("documentos", "ambiente", "ambiente TEXT")
+        _add_col_if_missing("documentos", "protocolo_autorizacao", "protocolo_autorizacao TEXT")
+        _add_col_if_missing("documentos", "data_autorizacao", "data_autorizacao TEXT")
+        _add_col_if_missing("documentos", "cstat", "cstat TEXT")
+        _add_col_if_missing("documentos", "xmotivo", "xmotivo TEXT")
+        _add_col_if_missing("documentos", "responsavel_tecnico", "responsavel_tecnico TEXT")
+
+        # OCR
+        _add_col_if_missing("documentos", "ocr_tipo", "ocr_tipo TEXT")
 
         # itens: campos adicionais usados pelo XML/NLP
         _add_col_if_missing("itens", "numero_item", "numero_item INTEGER")
@@ -280,7 +429,7 @@ class BancoDeDados:
         _add_col_if_missing("itens", "desconto", "desconto REAL")
         _add_col_if_missing("itens", "outras_despesas", "outras_despesas REAL")
 
-        # impostos: já está completo, mas reforça se faltou algo
+        # impostos: reforço
         _add_col_if_missing("impostos", "origem", "origem TEXT")
         _add_col_if_missing("impostos", "base_calculo", "base_calculo REAL")
         _add_col_if_missing("impostos", "aliquota", "aliquota REAL")
@@ -313,6 +462,8 @@ class BancoDeDados:
         colunas_validas = self._colunas_tabela(tabela)
         filtrados = {}
         for k, v in campos.items():
+            if not isinstance(k, str):
+                k = str(k)
             if k.startswith("__"):
                 continue
             if k not in colunas_validas:
@@ -325,16 +476,18 @@ class BancoDeDados:
             filtrados[k] = v
         if len(filtrados) < len(campos):
             diff = set(campos.keys()) - set(filtrados.keys())
-            log.debug(f"Campos ignorados para '{tabela}': {diff}")
+            if diff:
+                log.debug(f"Campos ignorados para '{tabela}': {diff}")
         return filtrados
 
     # ------------------------- Operações de escrita -------------------------
     def inserir_documento(self, **campos) -> int:
-        """
-        Insere na tabela documentos. Retorna ID.
-        """
+        """Insere na tabela documentos. Retorna ID."""
         if not campos:
             raise ValueError("Nenhum campo fornecido para inserir_documento.")
+        campos = self._filtrar_campos_validos("documentos", campos)
+        if not campos:
+            raise ValueError("Nenhum campo válido para inserir em 'documentos'.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO documentos ({columns}) VALUES ({placeholders})"
@@ -365,6 +518,9 @@ class BancoDeDados:
     def inserir_item(self, **campos) -> int:
         if not campos:
             raise ValueError("Nenhum campo fornecido para inserir_item.")
+        campos = self._filtrar_campos_validos("itens", campos)
+        if not campos:
+            raise ValueError("Nenhum campo válido para inserir em 'itens'.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO itens ({columns}) VALUES ({placeholders})"
@@ -376,6 +532,9 @@ class BancoDeDados:
     def inserir_imposto(self, **campos) -> int:
         if not campos:
             raise ValueError("Nenhum campo fornecido para inserir_imposto.")
+        campos = self._filtrar_campos_validos("impostos", campos)
+        if not campos:
+            raise ValueError("Nenhum campo válido para inserir em 'impostos'.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO impostos ({columns}) VALUES ({placeholders})"
@@ -387,6 +546,9 @@ class BancoDeDados:
     def inserir_extracao(self, **campos) -> int:
         if not campos:
             raise ValueError("Nenhum campo fornecido para inserir_extracao.")
+        campos = self._filtrar_campos_validos("extracoes", campos)
+        if not campos:
+            raise ValueError("Nenhum campo válido para inserir em 'extracoes'.")
         columns = ", ".join(campos.keys())
         placeholders = ", ".join("?" for _ in campos)
         sql = f"INSERT INTO extracoes ({columns}) VALUES ({placeholders})"
@@ -435,6 +597,120 @@ class BancoDeDados:
         )
         self.conn.commit()
 
+    # ------------------------- Operações de detalhes (key-value) -------------------------
+    def upsert_detalhe(self, documento_id: int, chave: str, valor: Any, origem: Optional[str] = None) -> int:
+        """
+        Insere/atualiza um par (documento_id, chave) em documentos_detalhes.
+        valor é salvo como TEXT (use json.dumps se precisar preservar estrutura).
+        Retorna id do registro.
+        """
+        if chave is None or chave == "":
+            raise ValueError("chave do detalhe não pode ser vazia.")
+        val = valor
+        if isinstance(val, (dict, list)):
+            try:
+                val = json.dumps(val, ensure_ascii=False)
+            except Exception:
+                val = str(val)
+        cur = self.conn.cursor()
+        # Tenta update; se não afetar linhas, faz insert
+        cur.execute("""
+            UPDATE documentos_detalhes
+               SET valor = ?, origem = COALESCE(?, origem)
+             WHERE documento_id = ? AND chave = ?
+        """, (val, origem, documento_id, chave))
+        if cur.rowcount == 0:
+            cur.execute("""
+                INSERT INTO documentos_detalhes (documento_id, chave, valor, origem, criado_em)
+                VALUES (?, ?, ?, ?, ?)
+            """, (documento_id, chave, val, origem, self.now()))
+        self.conn.commit()
+        # Retorna id
+        cur.execute("SELECT id FROM documentos_detalhes WHERE documento_id = ? AND chave = ?", (documento_id, chave))
+        row = cur.fetchone()
+        return int(row["id"]) if row else 0
+
+    def upsert_detalhes_bulk(self, documento_id: int, pares: Dict[str, Any], origem: Optional[str] = None) -> None:
+        """
+        Upsert em lote para (documento_id, chave->valor).
+        """
+        if not pares:
+            return
+        cur = self.conn.cursor()
+        for chave, valor in pares.items():
+            if not isinstance(chave, str) or not chave:
+                continue
+            val = valor
+            if isinstance(val, (dict, list)):
+                try:
+                    val = json.dumps(val, ensure_ascii=False)
+                except Exception:
+                    val = str(val)
+            cur.execute("""
+                UPDATE documentos_detalhes
+                   SET valor = ?, origem = COALESCE(?, origem)
+                 WHERE documento_id = ? AND chave = ?
+            """, (val, origem, documento_id, chave))
+            if cur.rowcount == 0:
+                cur.execute("""
+                    INSERT INTO documentos_detalhes (documento_id, chave, valor, origem, criado_em)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (documento_id, chave, val, origem, self.now()))
+        self.conn.commit()
+
+    def inserir_detalhe(self, documento_id: int, chave: str, valor: Any, origem: Optional[str] = None) -> int:
+        """
+        Insere detalhe (falha se já existir a mesma chave). Prefira upsert_detalhe.
+        """
+        if not chave:
+            raise ValueError("chave do detalhe não pode ser vazia.")
+        val = valor
+        if isinstance(val, (dict, list)):
+            try:
+                val = json.dumps(val, ensure_ascii=False)
+            except Exception:
+                val = str(val)
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT OR FAIL INTO documentos_detalhes (documento_id, chave, valor, origem, criado_em)
+            VALUES (?, ?, ?, ?, ?)
+        """, (documento_id, chave, val, origem, self.now()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def listar_detalhes(self, documento_id: int) -> Dict[str, str]:
+        """Retorna todos os detalhes (key->value TEXT) de um documento."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT chave, valor FROM documentos_detalhes WHERE documento_id = ?", (documento_id,))
+        out: Dict[str, str] = {}
+        for row in cur.fetchall():
+            out[str(row["chave"])] = row["valor"]
+        return out
+
+    def buscar_detalhe(self, documento_id: int, chave: str) -> Optional[str]:
+        """Retorna o valor TEXT de uma chave específica de um documento (ou None)."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT valor FROM documentos_detalhes WHERE documento_id = ? AND chave = ?", (documento_id, chave))
+        row = cur.fetchone()
+        return row["valor"] if row else None
+
+    def detalhes_dataframe(self, documento_id: Optional[int] = None, chave_prefix: Optional[str] = None) -> pd.DataFrame:
+        """
+        Retorna DataFrame de documentos_detalhes, filtrando por documento e/ou prefixo da chave.
+        """
+        where: List[str] = []
+        params: List[Any] = []
+        if documento_id is not None:
+            where.append("documento_id = ?")
+            params.append(documento_id)
+        if chave_prefix:
+            where.append("chave LIKE ?")
+            params.append(f"{chave_prefix}%")
+        sql = "SELECT * FROM documentos_detalhes"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        return pd.read_sql_query(sql, self.conn, params=params)
+
     # ------------------------- Operações de leitura -------------------------
     def find_documento_by_hash(self, doc_hash: str) -> Optional[int]:
         cur = self.conn.cursor()
@@ -456,7 +732,7 @@ class BancoDeDados:
         """
         allowed_tables = {
             "documentos", "itens", "impostos", "extracoes",
-            "logs", "memoria", "revisoes", "usuarios", "metricas"
+            "logs", "memoria", "revisoes", "usuarios", "metricas", "documentos_detalhes"
         }
         if table not in allowed_tables:
             raise ValueError(f"Tabela não suportada: {table}")

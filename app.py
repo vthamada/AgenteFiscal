@@ -1,21 +1,14 @@
 # app.py
 from __future__ import annotations
-from pathlib import Path
-import traceback
-import streamlit as st
-import pandas as pd
+
 import os
 import hashlib
+import traceback
+from pathlib import Path
+
+import streamlit as st
+import pandas as pd
 from dotenv import load_dotenv
-
-# Projeto
-from banco_de_dados import BancoDeDados
-from validacao import ValidadorFiscal
-from memoria import MemoriaSessao
-from orchestrator import Orchestrator
-
-# LLM
-from modelos_llm import make_llm, GEMINI_MODELS, OPENAI_MODELS, OPENROUTER_MODELS
 
 # ---------------------- Config da Página ----------------------
 st.set_page_config(
@@ -24,16 +17,43 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+st.markdown(
+    """
+    <style>
+    .stAlert div[data-baseweb="notification"] { padding: 0.6rem 0.8rem; }
+    .block-container { padding-top: 1.6rem; }
+    .uploadedFile { display: none; } /* esconde chips de upload duplicados */
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 load_dotenv()
 REGRAS_FISCAIS_PATH = Path("regras_fiscais.yaml")
 
-# ---------------------- Helpers (sem criptografia) ----------------------
+# ---------------------- Projeto (núcleo) ----------------------
+from banco_de_dados import BancoDeDados
+from validacao import ValidadorFiscal
+from memoria import MemoriaSessao
+from orchestrator import Orchestrator
+
+# ---------------------- LLM (opcional) ----------------------
+try:
+    from modelos_llm import make_llm, GEMINI_MODELS, OPENAI_MODELS, OPENROUTER_MODELS
+except Exception:
+    # Caso o módulo de LLM não esteja presente, definimos placeholders
+    def make_llm(*args, **kwargs):
+        raise RuntimeError("Módulo de LLM indisponível. Instale/Configure modelos_llm.py")
+
+    GEMINI_MODELS, OPENAI_MODELS, OPENROUTER_MODELS = [], [], []
+
+# ---------------------- Helpers ----------------------
 def hash_password(plain: str) -> str:
-    """Hash simples (sha256) para senha de usuário (propósito: demonstração)."""
+    """Hash simples (sha256) para senha de usuário (demonstração)."""
     return hashlib.sha256((plain or "").encode("utf-8")).hexdigest()
 
 def mask_doc(doc: str | None) -> str | None:
-    """Máscara simples para CNPJ/CPF exibidos em tabelas (não criptografa)."""
+    """Máscara simples para CNPJ/CPF exibidos em tabelas (apenas visual)."""
     if not doc:
         return doc
     s = "".join([c for c in str(doc) if c.isdigit()])
@@ -45,7 +65,7 @@ def mask_doc(doc: str | None) -> str | None:
 
 def mask_df_id_cols(df: pd.DataFrame) -> pd.DataFrame:
     """Aplica máscara de CNPJ/CPF em colunas padrão (apenas visual)."""
-    if df is None or df.empty:
+    if df is None or getattr(df, "empty", True):
         return df if df is not None else pd.DataFrame()
     df2 = df.copy()
     for col in ("emitente_cnpj", "destinatario_cnpj", "emitente_cpf", "destinatario_cpf"):
@@ -84,7 +104,7 @@ def get_core_services():
     memoria = MemoriaSessao(db)
     validador = ValidadorFiscal(regras_path=REGRAS_FISCAIS_PATH)
 
-    # Seed admin padrão
+    # Seed admin padrão (apenas se tabela estiver vazia)
     try:
         df_users = db.query_table("usuarios")
         if df_users.empty:
@@ -98,11 +118,11 @@ def get_core_services():
             )
             st.session_state.admin_just_created = True
     except Exception as e:
-        print(f"[WARN] Não foi possível checar/criar admin padrão: {e}")
+        st.warning(f"Não foi possível checar/criar admin padrão: {e}")
 
     return db, memoria, validador
 
-def configure_llm(provider, model, api_key):
+def configure_llm(provider: str | None, model: str | None, api_key: str | None):
     """Configura o LLM e retorna a instância (ou None)."""
     try:
         if not provider or not model:
@@ -155,6 +175,7 @@ def ui_sidebar_llm():
     with st.sidebar:
         st.markdown(f"**👤 {st.session_state.user_name or 'Usuário'}**")
         st.caption(f"Perfil: {st.session_state.user_profile or '—'}")
+
         if st.button("Sair", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.user_profile = None
@@ -197,7 +218,7 @@ def tab_processamento(orch: Orchestrator, db: BancoDeDados):
             "Selecione XML / PDF / Imagem",
             type=["xml", "pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp"],
             accept_multiple_files=True,
-            help="Você pode selecionar múltiplos arquivos de uma vez.",
+            help="Você pode selecionar múltiplos arquivos.",
         )
     with up_col2:
         origem = st.text_input("Origem (rótulo livre)", value="upload_ui")
@@ -217,7 +238,8 @@ def tab_processamento(orch: Orchestrator, db: BancoDeDados):
                 text=f"Processando: {up.name} ({i+1}/{len(uploaded_files)})...",
             )
             try:
-                doc_id = orch.ingestir_arquivo(up.name, up.getvalue(), origem=origem)
+                # Roteamento automático: XML -> parser, senão OCR/NLP
+                doc_id = orch.processar_automatico(up.name, up.getvalue(), origem=origem)
                 doc_info = orch.db.get_documento(doc_id)
                 status = (doc_info or {}).get("status", "desconhecido")
                 if status in ("revisao_pendente", "erro", "quarentena"):
@@ -260,7 +282,7 @@ def tab_processamento(orch: Orchestrator, db: BancoDeDados):
         st.dataframe(mask_df_id_cols(df_docs), use_container_width=True, height=430)
     except Exception as e:
         st.error(f"Erro na consulta de documentos: {e}")
-        st.exception(e)
+        st.code(traceback.format_exc(), language="python")
 
     st.markdown("---")
     st.subheader("🔎 Itens & Impostos por Documento (consulta rápida)")
@@ -300,7 +322,7 @@ def tab_processamento(orch: Orchestrator, db: BancoDeDados):
                 st.warning(f"Documento com ID {doc_id_q} não encontrado.")
         except Exception as e:
             st.error(f"Erro ao consultar: {e}")
-            st.exception(e)
+            st.code(traceback.format_exc(), language="python")
 
 def tab_revisao(orch: Orchestrator, db: BancoDeDados):
     st.subheader("🧐 Revisão Fiscal")
@@ -436,15 +458,18 @@ def tab_revisao(orch: Orchestrator, db: BancoDeDados):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Erro ao salvar revisões: {e}")
-                    st.exception(e)
+                    st.code(traceback.format_exc(), language="python")
 
             if cB.button("✅ Aprovar (Processado)", use_container_width=True):
-                db.atualizar_documento_campo(doc_id, "status", "processado")
-                db.atualizar_documento_campo(doc_id, "motivo_rejeicao", "Aprovado manualmente")
-                db.log("revisao_aprovada", st.session_state.user_name or "revisor_ui", f"doc_id={doc_id} processado.")
-                st.success(f"Documento ID {doc_id} marcado como 'processado'.")
-                st.session_state.doc_id_revisao = 0
-                st.rerun()
+                try:
+                    db.atualizar_documento_campo(doc_id, "status", "processado")
+                    db.atualizar_documento_campo(doc_id, "motivo_rejeicao", "Aprovado manualmente")
+                    db.log("revisao_aprovada", st.session_state.user_name or "revisor_ui", f"doc_id={doc_id} processado.")
+                    st.success(f"Documento ID {doc_id} marcado como 'processado'.")
+                    st.session_state.doc_id_revisao = 0
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Falha ao aprovar: {e}")
 
             if cC.button("🔁 Reprocessar", help="Re-extrai os dados do arquivo.", use_container_width=True):
                 with st.spinner(f"Reprocessando documento ID {doc_id}..."):
@@ -458,10 +483,10 @@ def tab_revisao(orch: Orchestrator, db: BancoDeDados):
                         st.rerun()
                     except Exception as e:
                         st.error(f"Falha ao acionar reprocessamento: {e}")
-                        st.exception(e)
+                        st.code(traceback.format_exc(), language="python")
     except Exception as e:
         st.error(f"Erro ao carregar documentos pendentes: {e}")
-        st.exception(e)
+        st.code(traceback.format_exc(), language="python")
 
 def tab_analises(orch: Orchestrator, db: BancoDeDados):
     st.subheader("🤖 Análises & LLM")
@@ -550,7 +575,10 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
     with st.expander("🧠 Memória LLM (Histórico de Perguntas)", expanded=False):
         try:
             mem = db.query_table("memoria")
-            st.dataframe(mem.sort_values("id", ascending=False), use_container_width=True, height=400)
+            if not mem.empty:
+                st.dataframe(mem.sort_values("id", ascending=False), use_container_width=True, height=400)
+            else:
+                st.info("Sem registros de memória ainda.")
         except Exception as e:
             st.error(f"Erro ao carregar memória: {e}")
 
@@ -637,7 +665,7 @@ def tab_metricas(orch: Orchestrator, db: BancoDeDados):
                 st.warning("O LLM não está configurado na barra lateral.")
     except Exception as e:
         st.error(f"Erro ao carregar métricas: {e}")
-        st.exception(e)
+        st.code(traceback.format_exc(), language="python")
 
 def tab_admin(db: BancoDeDados):
     st.subheader("⚙️ Administração")
@@ -743,7 +771,10 @@ def tab_admin(db: BancoDeDados):
             "Número de logs recentes:", min_value=10, max_value=1000, value=100, step=10, key="log_limit"
         )
         logs = db.query_table("logs")
-        st.dataframe(logs.sort_values("id", ascending=False).head(limit), use_container_width=True, height=420)
+        if not logs.empty:
+            st.dataframe(logs.sort_values("id", ascending=False).head(limit), use_container_width=True, height=420)
+        else:
+            st.info("Ainda não há logs registrados.")
     except Exception as e:
         st.error(f"Erro ao carregar logs: {e}")
 
@@ -799,7 +830,7 @@ def main():
                                     st.error(f"Erro ao criar usuário (email pode já existir): {e}")
         return
 
-    # Logado
+    # Logado — instancia Orchestrator com LLM opcional
     orch = Orchestrator(
         db=db,
         validador=validador,
@@ -810,7 +841,7 @@ def main():
     ui_header()
     ui_sidebar_llm()
 
-    # Navegação principal (5 seções)
+    # Navegação principal
     tabs = st.tabs([
         "📄 Processamento",
         "🧐 Revisão Fiscal",
