@@ -1,6 +1,6 @@
 # app.py
-from __future__ import annotations
 
+from __future__ import annotations
 import os
 import io
 import json
@@ -9,7 +9,6 @@ import hashlib
 import traceback
 from pathlib import Path
 from typing import Iterable, Optional, Dict, Any, List, Tuple
-
 import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv

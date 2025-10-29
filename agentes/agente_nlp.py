@@ -6,7 +6,6 @@ import re
 import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
-# Utilitários locais (mantidos)
 from .utils import (
     _parse_date_like, _to_float_br, _only_digits, _norm_ws, textual_truncate
 )
@@ -15,14 +14,13 @@ log = logging.getLogger("agente_fiscal.agentes")
 
 # =================== Prompts/LLM (centralizados) ===================
 try:
-    # Wrappers corretos (modelos_llm.py) — todos retornam dict {"content","json","meta","raw"}
     from modelos_llm import (
-        extract_header_json,     # (llm, schema_keys, text, extra_instructions=None, ...)
-        extract_items_json,      # idem
-        extract_taxes_json,      # idem
-        get_llm_identity,        # identidade do modelo
+        extract_header_json,
+        extract_items_json,
+        extract_taxes_json,
+        get_llm_identity,
     )
-except Exception:  # compat quando wrappers não existem no ambiente
+except Exception:
     extract_header_json = None
     extract_items_json = None
     extract_taxes_json = None
@@ -75,15 +73,141 @@ def preprocess_text(texto: str) -> str:
     return "\n".join(deduped).strip()
 
 
+# ============================== Mapas por tipo ==============================
+# Canonicalizamos os tipos retornados pelo classificador para chaves simples:
+# NFe, NFCe, NFSe, NFAe, CTe, OUTRO
+def _normalize_tipo(tipo: str) -> str:
+    t = (tipo or "").upper().replace("-", "").replace("_", "")
+    if "NFSE" in t or "NFS" in t:
+        return "NFSe"
+    if "NFCE" in t:
+        return "NFCe"
+    if "NFA" in t:
+        return "NFAe"
+    if "CTE" in t:
+        return "CTe"
+    if "NFE" in t:
+        return "NFe"
+    return "OUTRO"
+
+# Mapa de rótulos (sinônimos) sensíveis ao tipo do documento para campos críticos
+_MAPAS_CAMPOS: Dict[str, Dict[str, List[str]]] = {
+    "NFe": {
+        "emitente_nome": ["EMITENTE", "REMETENTE", "PRESTADOR DE SERVIÇOS", "EMPRESA", "RAZÃO SOCIAL", "RAZAO SOCIAL"],
+        "emitente_cnpj": ["CNPJ EMITENTE", "CNPJ REMETENTE", "CNPJ", "CNPJ/CPF", "CNPF", "CPF/CNPJ"],
+        "destinatario_nome": ["DESTINATÁRIO", "DESTINATARIO", "TOMADOR", "CLIENTE", "CONSUMIDOR", "RECEBEDOR"],
+        "destinatario_cnpj": ["CNPJ DESTINATÁRIO", "CNPJ DESTINATARIO", "CNPJ TOMADOR", "CPF/CNPJ", "CNPJ/CPF"],
+        "data_emissao": ["DATA DE EMISSÃO", "DATA DA EMISSÃO", "EMISSÃO", "DATA EMISSÃO", "EMITIDO EM", "EMISSAO"],
+        "data_saida": ["DATA DE SAÍDA", "DATA SAIDA", "SAÍDA", "DATA DE ENTRADA/SAÍDA", "DATA ENTRADA/SAÍDA"],
+        "hora_emissao": ["HORA DE EMISSÃO", "HORA EMISSÃO"],
+        "hora_saida": ["HORA DE SAÍDA", "HORA SAIDA", "HORA ENTRADA/SAÍDA"],
+        "numero_nota": ["Nº NOTA", "NÚMERO DA NOTA", "NOTA FISCAL Nº", "NÚMERO", "NUMERO", "Nº", "NF Nº"],
+        "serie": ["SÉRIE", "SERIE", "SÉRIE DA NOTA", "SÉRIE NF"],
+        "modelo": ["MODELO", "MOD", "MODELO DA NOTA", "MOD. NF"],
+        "natureza_operacao": ["NATUREZA DA OPERAÇÃO", "NATUREZA DA OPERACAO", "TIPO DE OPERAÇÃO", "FINALIDADE DA OPERAÇÃO"],
+        "forma_pagamento": ["FORMA DE PAGAMENTO", "CONDIÇÃO DE PAGAMENTO", "PAGAMENTO", "FORMA PAGAMENTO"],
+        "chave_acesso": ["CHAVE DE ACESSO", "CHAVE ELETRÔNICA", "CHAVE ELETRONICA", "CHNFE", "CHCTE", "CHAVE NF-E"],
+        "valor_total": ["VALOR TOTAL DA NOTA", "VALOR TOTAL", "VALOR LÍQUIDO", "VALOR LIQUIDO", "TOTAL DA NOTA", "VALOR DO DOCUMENTO", "VALOR TOTAL DO DOCUMENTO"],
+        "total_produtos": [ "TOTAL DOS PRODUTOS", "VALOR PRODUTOS", "TOTAL PRODUTOS", "VALOR TOTAL DOS PRODUTOS"],
+        "total_servicos": ["TOTAL DOS SERVIÇOS", "VALOR SERVIÇOS", "VALOR DO SERVIÇO", "SERVIÇO"],
+        "total_icms": ["ICMS", "VALOR ICMS", "BASE DE CÁLCULO ICMS", "BASE CALCULO ICMS"],
+        "total_ipi": ["IPI", "VALOR IPI", "BASE DE CÁLCULO IPI"],
+        "total_pis": ["PIS", "VALOR PIS"],
+        "total_cofins": ["COFINS", "VALOR COFINS"],
+        "valor_frete": ["VALOR DO FRETE", "VALOR FRETE", "FRETE", "FRETE POR CONTA"],
+        "valor_iss": ["VALOR ISS", "VALOR DO ISSQN", "ISSQN", "VALOR DO SERVIÇO", "VALOR SERVIÇOS"],
+        "valor_descontos": ["DESCONTO", "VALOR DO DESCONTO", "DESCONTOS", "VALOR DESCONTOS"],
+        "valor_outros": ["OUTRAS DESPESAS", "OUTROS VALORES", "OUTROS", "VALOR OUTRAS DESPESAS"],
+        "valor_liquido": ["VALOR LÍQUIDO", "VALOR LIQUIDO", "VALOR A PAGAR", "VALOR FINAL"],
+        "endereco": ["ENDEREÇO", "ENDERECO", "LOGRADOURO", "RUA", "AVENIDA", "TRAVESSA"],
+        "municipio": ["MUNICÍPIO", "MUNICIPIO", "CIDADE", "LOCALIDADE"],
+        "uf": ["UF", "ESTADO", "UNIDADE FEDERATIVA"],
+        "inscricao_estadual": ["INSCRIÇÃO ESTADUAL", "INSCRICAO ESTADUAL", "I.E.", "IE", "INSCR EST"],
+        "cfop": ["CFOP", "CFOP/CSOSN"],
+        "ncm": ["NCM", "NCM/SH", "NCM SH"],
+        "cst": ["CST", "CST ICMS", "CST/CSOSN"]
+    },
+
+    "NFAe": {
+        "emitente_nome": ["EMITENTE", "REMETENTE", "SECRETARIA", "ORGAO EMISSOR", "ÓRGÃO EMISSOR"],
+        "emitente_cnpj": ["CNPJ EMITENTE", "CNPJ", "CNPJ/CPF"],
+        "destinatario_nome": ["DESTINATÁRIO", "DESTINATARIO", "CONTRIBUINTE", "RECEBEDOR", "TOMADOR"],
+        "destinatario_cnpj": ["CNPJ DESTINATÁRIO", "CPF/CNPJ", "CNPJ/CPF"],
+        "data_emissao": ["DATA DE EMISSÃO", "DATA DA EMISSÃO", "EMISSÃO"],
+        "numero_nota": ["NÚMERO", "Nº", "NUMERO NOTA", "NFAE Nº"],
+        "serie": ["SÉRIE", "SERIE"],
+        "modelo": ["MODELO"],
+        "chave_acesso": ["CHAVE DE ACESSO", "NÚMERO DE AUTORIZAÇÃO", "CÓDIGO DE VALIDAÇÃO"],
+        "natureza_operacao": ["NATUREZA DA OPERAÇÃO", "FINALIDADE", "TIPO DE OPERAÇÃO"],
+        "valor_total": ["VALOR TOTAL", "VALOR DA NOTA", "TOTAL DA NOTA", "VALOR DA OPERAÇÃO", "VALOR TOTAL DO DOCUMENTO"],
+        "total_produtos": ["TOTAL PRODUTOS", "VALOR DOS PRODUTOS"],
+        "total_icms": ["ICMS", "VALOR ICMS"],
+        "valor_frete": ["VALOR FRETE", "VALOR DO FRETE"],
+        "valor_descontos": ["DESCONTO", "VALOR DESCONTO"],
+        "valor_outros": ["OUTRAS DESPESAS"],
+        "endereco": ["ENDEREÇO", "ENDERECO", "RUA", "LOGRADOURO"],
+        "municipio": ["MUNICÍPIO", "CIDADE"],
+        "uf": ["UF", "ESTADO"],
+        "inscricao_estadual": ["INSCRIÇÃO ESTADUAL", "IE"]
+    },
+
+    "NFSe": {
+        "emitente_nome": ["PRESTADOR DE SERVIÇOS", "EMITENTE", "EMPRESA", "RAZÃO SOCIAL"],
+        "emitente_cnpj": ["CNPJ PRESTADOR", "CNPJ", "CNPJ/CPF"],
+        "destinatario_nome": ["TOMADOR DE SERVIÇOS", "CLIENTE", "CONTRATANTE", "CONSUMIDOR"],
+        "destinatario_cnpj": ["CNPJ TOMADOR", "CPF/CNPJ", "CNPJ/CPF"],
+        "data_emissao": ["DATA DE EMISSÃO", "DATA DE GERAÇÃO", "COMPETÊNCIA", "DATA DE EMISSAO"],
+        "numero_nota": ["NÚMERO DA NFS-E", "NFS-E Nº", "Nº NFS-E", "NUMERO NFS-E"],
+        "chave_acesso": ["CÓDIGO DE VERIFICAÇÃO", "CHAVE DE ACESSO", "CÓDIGO VERIFICAÇÃO"],
+        "natureza_operacao": ["NATUREZA DA OPERAÇÃO", "SERVIÇO PRESTADO", "DISCRIMINAÇÃO DOS SERVIÇOS"],
+        "valor_total": ["VALOR DO SERVIÇO", "VALOR TOTAL DA NFS-E", "VALOR LÍQUIDO DA NFS-E", "VALOR TOTAL DO DOCUMENTO"],
+        "valor_iss": ["VALOR DO ISS", "ISSQN", "VALOR ISS", "VALOR ISSQN"],
+        "valor_descontos": ["DESCONTO", "VALOR DESCONTO INCONDICIONAL", "DESCONTO INCONDICIONAL"],
+        "valor_outros": ["RETENÇÕES", "OUTRAS DEDUÇÕES", "RETENCAO", "OUTRAS RETENCOES"],
+        "endereco": ["ENDEREÇO", "LOGRADOURO", "RUA"],
+        "municipio": ["MUNICÍPIO", "CIDADE"],
+        "uf": ["UF", "ESTADO"],
+        "inscricao_estadual": ["INSCRIÇÃO MUNICIPAL", "IM", "INSCRIÇÃO MUN."]
+    },
+
+    "CTe": {
+        "emitente_nome": ["REMETENTE", "TRANSPORTADOR", "EMITENTE", "EXPEDIDOR"],
+        "emitente_cnpj": ["CNPJ REMETENTE", "CNPJ TRANSPORTADOR", "CNPJ", "CNPJ/CPF"],
+        "destinatario_nome": ["DESTINATÁRIO", "DESTINATARIO", "RECEBEDOR", "CONSIGNATÁRIO"],
+        "destinatario_cnpj": ["CNPJ DESTINATÁRIO", "CPF DESTINATÁRIO", "CNPJ/CPF"],
+        "data_emissao": ["DATA DE EMISSÃO", "DATA/HORA DE EMISSÃO"],
+        "numero_nota": ["NÚMERO DO CONHECIMENTO", "CT-E Nº", "CONHECIMENTO Nº"],
+        "chave_acesso": ["CHAVE DE ACESSO", "CHCTE", "CHAVE CTE"],
+        "natureza_operacao": ["NATUREZA DA PRESTAÇÃO", "TIPO DE SERVIÇO", "SERVIÇO PRESTADO"],
+        "valor_total": ["VALOR TOTAL", "VALOR DA PRESTAÇÃO", "VALOR TOTAL DO SERVIÇO", "VALOR DO FRETE"],
+        "valor_frete": ["VALOR DO FRETE", "VALOR FRETE", "FRETE TOTAL"],
+        "endereco": ["ENDEREÇO", "RUA", "LOGRADOURO"],
+        "municipio": ["MUNICÍPIO", "CIDADE"],
+        "uf": ["UF", "ESTADO"]
+    },
+
+    "NFCe": {
+        "emitente_nome": ["EMITENTE", "ESTABELECIMENTO", "RAZÃO SOCIAL", "NOME EMPRESARIAL", "EMPRESA"],
+        "emitente_cnpj": ["CNPJ", "CNPJ/CPF", "CPF/CNPJ", "CNPF"],
+        "data_emissao": ["DATA DE EMISSÃO", "DATA EMISSÃO", "EMITIDO EM", "DATA DE EMISSAO"],
+        "numero_nota": ["NÚMERO", "Nº", "NUMERO DA VENDA", "NÚMERO DO CUPOM", "NÚMERO NFC-E"],
+        "serie": ["SÉRIE", "SERIE"],
+        "chave_acesso": ["CHAVE DE ACESSO", "CHAVE ELETRÔNICA", "CHAVE ELETRONICA", "CHNFE"],
+        "valor_total": ["VALOR TOTAL", "VALOR A PAGAR", "VALOR LÍQUIDO", "TOTAL R$", "VALOR FINAL", "TOTAL DA COMPRA"],
+        "total_produtos": ["VALOR DOS PRODUTOS", "TOTAL PRODUTOS", "TOTAL DOS PRODUTOS"],
+        "forma_pagamento": ["FORMA DE PAGAMENTO", "PAGAMENTO", "MEIO DE PAGAMENTO", "FORMA PAGTO"],
+        "natureza_operacao": ["NATUREZA DA OPERAÇÃO", "FINALIDADE", "VENDA AO CONSUMIDOR"],
+        "endereco": ["ENDEREÇO", "RUA", "LOGRADOURO"],
+        "municipio": ["MUNICÍPIO", "CIDADE"],
+        "uf": ["UF", "ESTADO"]
+    }
+}
+
+
 # ============================== Agente NLP ==============================
 class AgenteNLP:
     """
-    Agente de Interpretação Cognitiva:
-      • Heurística determinística (regex + contexto de seção)
-      • LLM condicional (gating por coverage e chaves críticas)
-      • Fusão cognitiva (heurística ↔ LLM) com explicabilidade por campo
-      • Memória leve por layout (layout_hash)
-      • __meta__ rico e consistente com o projeto
+    Agente de Interpretação Cognitiva (OCR → campos estruturados)
     """
 
     # ---------- padrões determinísticos ----------
@@ -123,16 +247,15 @@ class AgenteNLP:
     RE_NCM_ITEM     = re.compile(r"\bNCM[:\s]*([0-9]{8})\b", re.I)
     RE_CFOP_ITEM    = re.compile(r"\bCFOP[:\s]*([0-9]{4})\b", re.I)
     RE_CST_ITEM     = re.compile(r"\bCST[:\s]*([0-9]{2})\b", re.I)
+    RE_COD_ITEM     = re.compile(r"\b(CÓD(?:\.)?|COD(?:\.)?|CÓDIGO|CODIGO|EAN|GTIN)\s*[:\-]?\s*([A-Z0-9\-\.]{3,30})", re.I)
 
     RE_CHAVE = re.compile(r"\b(\d{44})\b")
     RE_QR    = re.compile(r"(?:chNFe|chCTe)=([0-9]{44})")
 
     RE_MOEDA_BR = re.compile(r"(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})")
 
-    # ----------------------- memória de layouts -----------------------
     _layout_memory: Dict[str, Dict[str, Any]] = {}  # layout_hash -> stats/hints
 
-    # ---------------------------- Init ----------------------------
     def __init__(
         self,
         llm: Optional["BaseChatModel"] = None,
@@ -140,14 +263,13 @@ class AgenteNLP:
         enable_llm: bool = True,
         llm_trigger_missing_keys: Optional[List[str]] = None,
         llm_max_chars_ocr: int = 6000,
-        base_weight: float = 0.7,  # peso heurística (1-base_weight é o "espaço" para LLM)
+        base_weight: float = 0.7,
     ):
         self.llm = llm if enable_llm and isinstance(llm, BaseChatModel) else None
         self.llm_max_chars_ocr = int(llm_max_chars_ocr)
         self.base_weight = float(base_weight)
         self.trigger_keys = llm_trigger_missing_keys or ["emitente_cnpj", "valor_total", "data_emissao"]
 
-        # Schema de cabeçalho (mantém compat com DB/normalizador)
         self.schema_campos = [
             "chave_acesso","numero_nota","serie","modelo","data_emissao","data_saida","hora_emissao","hora_saida",
             "emitente_nome","emitente_cnpj","emitente_cpf","emitente_ie","emitente_im",
@@ -159,24 +281,15 @@ class AgenteNLP:
             "uf","municipio","inscricao_estadual","endereco","cfop","ncm","cst","natureza_operacao",
             "forma_pagamento","cnpj_autorizado","observacoes",
         ]
-
-        # Schema de itens/impostos para wrappers
         self.schema_itens = ["descricao","codigo_produto","ncm","cfop","unidade","quantidade","valor_unitario","valor_total"]
         self.schema_impostos = ["item_idx","tipo_imposto","cst","origem","base_calculo","aliquota","valor"]
 
-        # caches/explicabilidade
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._explanations: Dict[str, Dict[str, Any]] = {}
         self._conf_per_field: Dict[str, float] = {}
 
     # ============================ Público ============================
     def extrair_campos(self, entrada: Any, ocr_meta: Optional[dict] = None) -> Dict[str, Any]:
-        """
-        Suporta dois formatos de entrada:
-          1) str -> texto OCR
-          2) dict -> {"texto_ocr": str, "ocr_meta": {...}}
-        Mantém compatibilidade com versões antigas do orchestrator.
-        """
         if isinstance(entrada, dict):
             texto = (entrada.get("texto_ocr") or "") if isinstance(entrada.get("texto_ocr"), str) else ""
             meta_in = entrada.get("ocr_meta") or {}
@@ -196,39 +309,37 @@ class AgenteNLP:
             res["__meta__"] = res_meta
             return res
 
-        # reset explicabilidade por rodada
         self._explanations = {}
         self._conf_per_field = {}
 
-        # pré-processo agressivo anti-monobloco
         texto_pp = preprocess_text(texto)
         t_pre   = self._pre_normalize_ocr(texto_pp)
         t_norm  = _norm_ws(t_pre)
 
-        # 1) classificar
+        # Classificação + normalização do tipo
         cls = self._cls_doc(t_pre)
-        doc_tipo = cls.get("tipo", "OUTRO")
+        doc_tipo_raw = cls.get("tipo", "OUTRO")
         conf_cls = float(cls.get("conf", 0.0) or 0.0)
+        doc_tipo = _normalize_tipo(doc_tipo_raw)
 
-        # 2) heurística base
-        base = self._extrair_campos_deterministico(t_norm, texto_original=t_pre)
+        # Determinístico (sensível ao tipo)
+        base = self._extrair_campos_deterministico(t_norm, texto_original=t_pre, tipo_doc=doc_tipo)
         meta_base = self._score_meta_deterministico(base)
         base = self._heuristica_intermediaria(base, t_norm)
 
         itens_ocr = base.get("itens_ocr") or []
         impostos_ocr = base.get("impostos_ocr") or []
 
-        # 3) Decidir LLM
+        # Decisão de acionar LLM
         use_llm = self.llm is not None and (self._deve_acionar_llm(base) or not itens_ocr) and len(t_norm) >= 20
         llm_provider = None; llm_model = None
         if self.llm and get_llm_identity:
             try:
-                ident = get_llm_identity(self.llm)  # {'provider':..., 'model':..., 'temperature':...}
+                ident = get_llm_identity(self.llm)
                 llm_provider, llm_model = ident.get("provider"), ident.get("model")
             except Exception:
                 pass
 
-        # 4) LLM headers/itens/impostos via wrappers corretos
         llm_hdr: Dict[str, Any] = {}
         llm_itens: List[Dict[str, Any]] = []
         llm_impostos: List[Dict[str, Any]] = []
@@ -236,7 +347,6 @@ class AgenteNLP:
 
         if use_llm:
             try:
-                # Cabeçalho
                 if extract_header_json and callable(extract_header_json):
                     hdr_out = extract_header_json(
                         self.llm,
@@ -244,19 +354,17 @@ class AgenteNLP:
                         text=textual_truncate(t_pre, self.llm_max_chars_ocr),
                         extra_instructions=f"Tipo de documento: {doc_tipo}"
                     )
-                    llm_hdr = dict(hdr_out.get("json") or {})
+                    llm_hdr_json = hdr_out.get("json")
+                    llm_hdr = dict(llm_hdr_json) if isinstance(llm_hdr_json, dict) else {}
                     meta_llm_hdr = dict(hdr_out.get("meta") or {})
-                    # Marcar explicabilidade LLM do header
                     for k, v in (llm_hdr or {}).items():
                         if v not in (None, "", [], {}):
                             self._add_explanation(k, method="llm", confidence=0.75, evidence=str(v)[:120])
                 else:
                     llm_hdr = self._extract_header_llm_fallback(t_pre, doc_tipo)
 
-                # Desambiguação Emitente/Destinatário (correção de inversão)
                 llm_hdr = self._role_disambiguation(base, llm_hdr, t_pre)
 
-                # Itens
                 if not itens_ocr:
                     if extract_items_json and callable(extract_items_json):
                         it_out = extract_items_json(
@@ -265,13 +373,13 @@ class AgenteNLP:
                             text=textual_truncate(t_pre, self.llm_max_chars_ocr),
                             extra_instructions=f"Tipo de documento: {doc_tipo}"
                         )
-                        llm_itens = list(it_out.get("json") or [])  # lista
+                        it_json = it_out.get("json")
+                        llm_itens = list(it_json) if isinstance(it_json, list) else []
                         if llm_itens:
                             self._add_explanation("itens", method="llm", confidence=0.7, evidence=f"{len(llm_itens)} itens")
                     else:
                         llm_itens = self._extract_itens_llm_fallback(t_pre, doc_tipo)
 
-                # Impostos
                 if not impostos_ocr:
                     if extract_taxes_json and callable(extract_taxes_json):
                         tx_out = extract_taxes_json(
@@ -283,7 +391,8 @@ class AgenteNLP:
                                 "itens_preview": (llm_itens or itens_ocr)[:10]
                             }, ensure_ascii=False)
                         )
-                        llm_impostos = list(tx_out.get("json") or [])
+                        tx_json = tx_out.get("json")
+                        llm_impostos = list(tx_json) if isinstance(tx_json, list) else []
                         if llm_impostos:
                             self._add_explanation("impostos", method="llm", confidence=0.65, evidence=f"{len(llm_impostos)} impostos")
                     else:
@@ -292,22 +401,30 @@ class AgenteNLP:
             except Exception as e:
                 log.warning(f"AgenteNLP LLM erro: {e}")
 
-        # 5) Fusão cognitiva (base ↔ LLM)
+        # ---------- Fusão + pós-tratamento de ITENS ----------
         fused, meta_fusion = self._fundir_resultados(base, llm_hdr, meta_base)
         meta_fusion["doc_tipo"] = doc_tipo
         meta_fusion["conf_cls"] = conf_cls
         meta_fusion["meta_llm_header"] = meta_llm_hdr
 
-        # 6) unificação de itens/impostos
-        itens_final = itens_ocr if itens_ocr else (llm_itens or [])
+        itens_candidatos = itens_ocr if itens_ocr else (llm_itens or [])
+        itens_final = self._pos_tratamento_itens(itens_candidatos)
         impostos_final = impostos_ocr if impostos_ocr else (llm_impostos or [])
 
-        # 7) sanitização + checks
+        # recalcula total_produtos se não veio
+        if itens_final and not fused.get("total_produtos"):
+            soma = self._soma_valor_itens(itens_final)
+            if soma:
+                fused["total_produtos"] = soma
+                self._add_explanation("total_produtos", method="post_items", confidence=0.85, evidence=str(soma))
+
+        # preenche NCM/CFOP/CST globais por maioria, se faltar
+        self._inferir_campos_globais_por_itens(fused, itens_final)
+
         fused = self._sanear_dados(fused)
         checks = self._coherence_checks(fused, itens_final, impostos_final)
         meta_fusion.update(checks or {})
 
-        # 8) coverage & __meta__
         coverage = sum(1 for k in self.schema_campos if fused.get(k)) / float(len(self.schema_campos))
         meta_common = {
             "source": "fusion" if use_llm else "deterministico",
@@ -327,9 +444,17 @@ class AgenteNLP:
         fused["impostos"] = impostos_final
         fused["__meta__"] = {**meta_common, **meta_fusion}
 
-        # 9) memória de layout (autoaprendizado leve)
-        self._update_layout_memory(layout_hash, doc_tipo, fused)
+        # Logging operacional para diagnóstico rápido
+        try:
+            log.info(
+                f"[NLP] Tipo={doc_tipo} | Cobertura={meta_common['coverage']:.2f} | "
+                f"LLM={'ON' if use_llm else 'OFF'} | CamposOK={sum(1 for k in self.schema_campos if fused.get(k))} | "
+                f"Itens={len(itens_final)} | CacheHit={False}"
+            )
+        except Exception:
+            pass
 
+        self._update_layout_memory(layout_hash, doc_tipo, fused)
         self._cache[key] = dict(fused)
         return fused
 
@@ -345,11 +470,10 @@ class AgenteNLP:
             e.setdefault("pattern", pattern[:180])
         self._conf_per_field[field] = max(self._conf_per_field.get(field, 0.0), float(confidence))
 
-    def _extrair_campos_deterministico(self, t_norm: str, *, texto_original: str) -> Dict[str, Any]:
+    def _extrair_campos_deterministico(self, t_norm: str, *, texto_original: str, tipo_doc: str = "OUTRO") -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         sec_emit, sec_dest = self._split_secoes(texto_original)
 
-        # CNPJ/CPF (com explicabilidade por seção)
         emit_cnpj = self._get_cnpj_por_contexto(sec_emit)
         if emit_cnpj:
             self._add_explanation("emitente_cnpj", method="regex_section", confidence=0.95, evidence=self._peek(sec_emit, emit_cnpj), pattern="RE_CNPJ_LABEL|RE_CNPJ")
@@ -374,7 +498,6 @@ class AgenteNLP:
         out["destinatario_cnpj"] = dest_cnpj if (dest_cnpj and len(dest_cnpj) >= 14) else None
         out["destinatario_cpf"]  = dest_cnpj if (dest_cnpj and len(dest_cnpj) == 11) else None
 
-        # IE/IM
         ie_m = self.RE_IE.search(sec_emit or "") or self.RE_IE.search(t_norm)
         if ie_m:
             out["emitente_ie"] = ie_m.group(1)
@@ -392,7 +515,6 @@ class AgenteNLP:
         if out["destinatario_im"]:
             self._add_explanation("destinatario_im", method="regex_section", confidence=0.7, evidence=out["destinatario_im"], pattern="RE_IM")
 
-        # Endereços/municípios/UF por seção
         e_end, e_mun, e_uf = self._extrair_endereco_bloco(sec_emit) if sec_emit else (None, None, None)
         d_end, d_mun, d_uf = self._extrair_endereco_bloco(sec_dest) if sec_dest else (None, None, None)
 
@@ -421,14 +543,14 @@ class AgenteNLP:
         if not out.get("emitente_uf"):
             out["emitente_uf"] = uf_global
 
-        # Nomes
         out["emitente_nome"] = self._capturar_bloco(sec_emit or t_norm, ["razão social","razao social","nome/razão","emitente","prestador","empresa"], max_chars=150)
         if out["emitente_nome"]: self._add_explanation("emitente_nome", method="block", confidence=0.55, evidence=out["emitente_nome"])
         out["destinatario_nome"] = self._capturar_bloco(sec_dest or t_norm, ["destinatário","tomador","cliente","consumidor"], max_chars=150)
         if out["destinatario_nome"]: self._add_explanation("destinatario_nome", method="block", confidence=0.55, evidence=out["destinatario_nome"])
 
-        # Totais, datas, identificação
-        out["valor_total"] = self._achar_valor_total(t_norm)
+        # valor_total (sensível ao tipo)
+        mapa = _MAPAS_CAMPOS.get(tipo_doc, _MAPAS_CAMPOS["OUTRO"])
+        out["valor_total"] = self._achar_valor_total(t_norm, labels=mapa.get("valor_total"))
         if out["valor_total"] is not None:
             self._add_explanation("valor_total", method="regex_near", confidence=0.9, evidence=str(out["valor_total"]), pattern="RE_VALOR_TOTAL/RE_NUM_VALOR")
 
@@ -453,7 +575,7 @@ class AgenteNLP:
             out["forma_pagamento"] = self._limpa_linha(forma)
             self._add_explanation("forma_pagamento", method="regex", confidence=0.65, evidence=out["forma_pagamento"], pattern="RE_FORMA_PGTO")
 
-        # Chave de acesso
+        # chave de acesso (usa mapa por tipo como reforço textual)
         chave = None
         mqr = self.RE_QR.search(t_norm)
         if mqr: chave = _only_digits(mqr.group(1))
@@ -463,8 +585,18 @@ class AgenteNLP:
         out["chave_acesso"] = chave
         if chave: self._add_explanation("chave_acesso", method="regex", confidence=0.95, evidence=chave, pattern="RE_QR|RE_CHAVE")
 
-        # Itens + impostos (determinístico OCR)
-        itens, impostos = self._extrair_itens_impostos_ocr(texto_original)
+        # Itens & Impostos com fallback inteligente (NFSe etc.)
+        itens, impostos = self._extrair_itens_impostos_ocr(texto_original, tipo_doc=tipo_doc)
+        if not itens and tipo_doc == "NFSe" and (out.get("valor_total") is not None):
+            # NFSe típica sem tabela propriamente dita → um serviço com o total
+            itens = [{
+                "descricao": "Serviço (NFSe)",
+                "codigo_produto": None,
+                "ncm": None, "cfop": None, "unidade": "UN",
+                "quantidade": 1, "valor_unitario": float(out["valor_total"]),
+                "valor_total": float(out["valor_total"])
+            }]
+            self._add_explanation("itens_ocr", method="nfse_fallback", confidence=0.6, evidence="Serviço único NFSe")
         out["itens_ocr"]    = itens
         out["impostos_ocr"] = impostos
 
@@ -473,7 +605,6 @@ class AgenteNLP:
             out["total_produtos"] = soma_itens
             self._add_explanation("total_produtos", method="sum_items", confidence=0.8, evidence=str(soma_itens))
 
-        # NCM/CFOP/CST globais (se aparecer em cabeçalhos/rodapés)
         if not out.get("ncm"):
             m_n = self.RE_NCM_ITEM.search(t_norm)
             if m_n:
@@ -532,9 +663,8 @@ class AgenteNLP:
         if self.llm is None:
             return {"tipo": heur, "conf": 0.6}
 
-        # Fallback simples com LLM (mantido opcional)
         sys = SystemMessage(content=(
-            "Classifique o tipo de documento fiscal brasileiro no texto (NF-e, NFC-e, NFS-e, NFA-e ou OUTRO). "
+            "Classifique o tipo de documento fiscal brasileiro no texto (NF-e, NFC-e, NFS-e, NFA-e, CTe ou OUTRO). "
             "Responda apenas JSON: {\"tipo\":..., \"conf\":0..1}."
         ))
         usr = HumanMessage(content=textual_truncate(texto, self.llm_max_chars_ocr))
@@ -562,13 +692,16 @@ class AgenteNLP:
             f"Texto OCR:\n{ textual_truncate(texto, self.llm_max_chars_ocr) }\n\n"
             f"Schema chaves: {schema}"
         ))
-        resp = self.llm.invoke([sys, usr])  # type: ignore
-        payload = self._safe_parse_json(getattr(resp, "content", "") or str(resp))
-        if isinstance(payload, dict):
-            for k, v in payload.items():
-                if v not in (None, "", []):
-                    self._add_explanation(k, method="llm", confidence=0.75, evidence=str(v)[:120])
-            return payload
+        try:
+            resp = self.llm.invoke([sys, usr])  # type: ignore
+            payload = self._safe_parse_json(getattr(resp, "content", "") or str(resp))
+            if isinstance(payload, dict):
+                for k, v in payload.items():
+                    if v not in (None, "", []):
+                        self._add_explanation(k, method="llm", confidence=0.75, evidence=str(v)[:120])
+                return payload
+        except Exception as e:
+            log.warning(f"LLM header fallback falhou: {e}")
         return {}
 
     def _extract_itens_llm_fallback(self, texto: str, doc_tipo: str) -> List[Dict[str, Any]]:
@@ -584,26 +717,22 @@ class AgenteNLP:
             f"Tipo: {doc_tipo}\n"
             f"Texto OCR:\n{ textual_truncate(texto, self.llm_max_chars_ocr) }"
         ))
-        resp = self.llm.invoke([sys, usr])  # type: ignore
-        payload = self._safe_parse_json(getattr(resp, "content", "") or str(resp))
+        try:
+            resp = self.llm.invoke([sys, usr])  # type: ignore
+            payload = self._safe_parse_json(getattr(resp, "content", "") or str(resp))
+        except Exception as e:
+            log.warning(f"LLM itens fallback falhou: {e}")
+            payload = {}
+
         itens: List[Dict[str, Any]] = []
         if isinstance(payload, list):
             itens = payload
         elif isinstance(payload, dict) and "itens" in payload and isinstance(payload["itens"], list):
             itens = payload["itens"]
+
         clean: List[Dict[str, Any]] = []
         for it in itens:
-            d = dict(it or {})
-            d["descricao"] = _norm_ws(str(d.get("descricao") or "")) or None
-            for k in ("quantidade","valor_unitario","valor_total"):
-                if d.get(k) is not None:
-                    d[k] = _to_float_br(str(d[k]))
-            for k in ("ncm","cfop"):
-                if d.get(k):
-                    d[k] = _only_digits(str(d[k]))
-            if d.get("unidade"):
-                u = str(d["unidade"]).strip().upper()
-                d["unidade"] = u if re.fullmatch(r"[A-Z]{1,4}", u) else None
+            d = self._normalize_item(it)
             clean.append(d)
         if clean:
             self._add_explanation("itens", method="llm", confidence=0.7, evidence=f"{len(clean)} itens")
@@ -622,8 +751,13 @@ class AgenteNLP:
             "texto": textual_truncate(texto, self.llm_max_chars_ocr),
             "itens_preview": (itens or [])[:10]
         }, ensure_ascii=False))
-        resp = self.llm.invoke([sys, usr])  # type: ignore
-        payload = self._safe_parse_json(getattr(resp, "content", "") or str(resp))
+        try:
+            resp = self.llm.invoke([sys, usr])  # type: ignore
+            payload = self._safe_parse_json(getattr(resp, "content", "") or str(resp))
+        except Exception as e:
+            log.warning(f"LLM impostos fallback falhou: {e}")
+            payload = {}
+
         out: List[Dict[str, Any]] = []
         if isinstance(payload, list):
             out = payload
@@ -637,7 +771,10 @@ class AgenteNLP:
                 except Exception: dd["item_idx"] = None
             for k in ("base_calculo","aliquota","valor"):
                 if dd.get(k) is not None:
-                    dd[k] = _to_float_br(str(dd[k]))
+                    try:
+                        dd[k] = _to_float_br(str(dd[k]))
+                    except Exception:
+                        dd[k] = None
             t = (dd.get("tipo_imposto") or "").upper()
             dd["tipo_imposto"] = t if t in ("ICMS","IPI","PIS","COFINS","ISS","OUTRO") else "OUTRO"
             imp_san.append(dd)
@@ -649,8 +786,6 @@ class AgenteNLP:
     def _fundir_resultados(self, base: Dict[str, Any], llm_out: Dict[str, Any], meta_base: Dict[str, float]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         result: Dict[str, Any] = dict(base)
         meta: Dict[str, Any] = {"meta_base": meta_base}
-
-        # Heurística de peso: preferimos base para campos numéricos/datas/identificadores
         llm_threshold = max(0.0, min(1.0, 1.0 - float(self.base_weight)))
 
         for k in self.schema_campos:
@@ -660,13 +795,18 @@ class AgenteNLP:
                 continue
             if not self._valor_valido_para_chave(k, llm_v):
                 continue
+
+            # Se base já tem valor e confiança alta, não sobrescreve
+            if base_v not in (None, "", []) and self._conf_per_field.get(k, 0.0) >= 0.75:
+                continue
+
             if base_v in (None, "", []):
                 result[k] = llm_v
                 self._add_explanation(k, method="llm", confidence=0.75, evidence=str(llm_v)[:120])
                 continue
-            # Se já há valor, só trocar por LLM se for campo textual e houver confiança/ganho
+
+            # Campos textuais podem ser melhorados pela LLM se base_weight permitir
             if isinstance(llm_v, str) and not k.startswith(("valor_","total_","data_","emitente_cnpj","destinatario_cnpj","emitente_cpf","destinatario_cpf")):
-                # sem meta de confiança por campo no wrapper — usamos threshold fixo
                 if llm_threshold >= 0.3 and not isinstance(base_v, (int, float)):
                     result[k] = llm_v
                     self._add_explanation(k, method="llm_fusion", confidence=max(0.75, llm_threshold), evidence=str(llm_v)[:120])
@@ -699,29 +839,17 @@ class AgenteNLP:
             return ("", "")
 
     def _role_disambiguation(self, base: Dict[str, Any], cand: Dict[str, Any], texto: str) -> Dict[str, Any]:
-        """
-        Corrige inversão Emitente/Destinatário (problema reportado).
-        Regras:
-          1) Seções rotuladas têm prioridade (emitente_* deve aparecer na seção 'Emitente')
-          2) CNPJ duplicado → o que aparece junto a 'Emitente' fica como emitente
-          3) IE/IM só são copiadas se existirem; não preencher IE/IM com outro campo
-        """
         if not cand:
             return base
         out = dict(cand)
-
-        # Não copiar IE/IM inválidos
         for k in ("emitente_ie","emitente_im","destinatario_ie","destinatario_im"):
             v = out.get(k)
             if isinstance(v, str) and not v.strip():
                 out[k] = None
-
-        # Heurística simples: se 'emitente_cnpj' não for 14+ e 'destinatario_cnpj' for, troque
         em, ds = out.get("emitente_cnpj"), out.get("destinatario_cnpj")
         em_ok = em and len(_only_digits(str(em))) >= 14
         ds_ok = ds and len(_only_digits(str(ds))) >= 14
         if not em_ok and ds_ok:
-            # Troca papéis apenas do par CNPJ/CPF/nome/end/mun/uf
             swaps = [
                 ("emitente_cnpj","destinatario_cnpj"),
                 ("emitente_cpf","destinatario_cpf"),
@@ -732,7 +860,6 @@ class AgenteNLP:
             ]
             for a,b in swaps:
                 out[a], out[b] = out.get(b), out.get(a)
-
         return out
 
     def _get_cnpj_por_contexto(self, texto: Optional[str]) -> Optional[str]:
@@ -819,7 +946,27 @@ class AgenteNLP:
         try: return m.group(idx).strip() if m else None
         except Exception: return None
 
-    def _achar_valor_total(self, texto: str) -> Optional[float]:
+    def _achar_valor_total(self, texto: str, labels: Optional[List[str]] = None) -> Optional[float]:
+        """
+        Busca 'valor_total' próximo a rótulos conhecidos. Se labels não for passado,
+        usa o padrão genérico (RE_VALOR_TOTAL).
+        """
+        if labels:
+            # Tenta linha a linha com rótulos fornecidos
+            linhas = texto.splitlines()
+            for i, linha in enumerate(linhas):
+                up = (linha or "").upper()
+                if any(lbl.upper() in up for lbl in labels):
+                    nm = self.RE_NUM_VALOR.search(linha)
+                    if nm:
+                        v = _to_float_br(nm.group(1))
+                        if v and v > 0: return v
+                    if i + 1 < len(linhas):
+                        nm2 = self.RE_NUM_VALOR.search(linhas[i + 1])
+                        v2 = _to_float_br(nm2.group(1)) if nm2 else None
+                        if v2 and v2 > 0: return v2
+
+        # Fallback genérico
         linhas = texto.splitlines()
         for i, linha in enumerate(linhas):
             if self.RE_VALOR_TOTAL.search(linha):
@@ -838,7 +985,7 @@ class AgenteNLP:
         return None
 
     # ================== Itens & Impostos (OCR) ==================
-    def _extrair_itens_impostos_ocr(self, texto_original: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    def _extrair_itens_impostos_ocr(self, texto_original: str, *, tipo_doc: str = "OUTRO") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         t = texto_original or ""
         if not t.strip():
             return [], []
@@ -859,53 +1006,77 @@ class AgenteNLP:
             if itens:
                 self._add_explanation("itens_ocr", method="regex_table", confidence=0.7, evidence=f"{len(itens)} itens")
                 return itens, impostos
+
+        # Fallback genérico (linhas soltas com valores)
         itens_fb, impostos_fb = self._parse_itens_fallback(linhas)
         if itens_fb:
             self._add_explanation("itens_ocr", method="regex_fallback", confidence=0.55, evidence=f"{len(itens_fb)} itens")
             return itens_fb, impostos_fb
+
+        # Último fallback: se NFSe, pode não existir tabela de itens
+        if tipo_doc == "NFSe":
+            # Tenta localizar um valor de serviço dedicado
+            valor_serv = self._achar_valor_total(
+                "\n".join(linhas),
+                labels=_MAPAS_CAMPOS["NFSe"]["valor_total"]
+            )
+            if valor_serv:
+                return ([{
+                    "descricao": "Serviço (NFSe)",
+                    "codigo_produto": None,
+                    "ncm": None, "cfop": None, "unidade": "UN",
+                    "quantidade": 1, "valor_unitario": float(valor_serv),
+                    "valor_total": float(valor_serv)
+                }], [])
         return [], []
 
     def _parse_itens_linhas(self, linhas: List[str], inicio: int, fim: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         itens: List[Dict[str, Any]] = []
         impostos: List[Dict[str, Any]] = []
         item_idx_counter = 0
-        for i in range(inicio, max(inicio, fim)):
+        for i in range(inicio, fim):
             linha = _norm_ws(linhas[i].strip())
             if not linha: continue
+            # 1) Pipes
             if "|" in linha:
                 cols = [c.strip() for c in self.RE_SPLIT_PIPES.split(linha) if c.strip()]
                 if len(cols) >= 5:
                     desc = cols[0]
-                    un   = cols[1] if re.fullmatch(r"[A-Z]{1,4}", cols[1]) else None
+                    cod  = self._inferir_codigo_produto(desc)
+                    un   = cols[1] if re.fullmatch(r"[A-Z]{1,4}", cols[1]) else self._inferir_unidade(cols[1])
                     qtd  = _to_float_br(cols[-3])
                     vun  = _to_float_br(cols[-2])
                     vtot = _to_float_br(cols[-1])
-                    if vtot or vun:
-                        item = {"descricao": _norm_ws(desc), "unidade": un, "quantidade": qtd, "valor_unitario": vun, "valor_total": vtot, "ncm": None, "cfop": None, "cst": None}
-                        ncm, cfop, cst = self._ncm_cfop_cst_context(linhas, i, inicio, fim)
-                        item["ncm"], item["cfop"], item["cst"] = ncm, cfop, cst
-                        itens.append(item)
-                        for tp in ("ICMS","IPI","PIS","COFINS"):
-                            ali = self._aliquota_contexto(linhas, i, inicio, fim, tp)
-                            if ali is not None:
-                                impostos.append({"item_idx": item_idx_counter, "tipo_imposto": tp, "aliquota": ali})
-                        item_idx_counter += 1
-                        continue
+                    item = {"descricao": _norm_ws(desc), "codigo_produto": cod, "unidade": un, "quantidade": qtd, "valor_unitario": vun, "valor_total": vtot, "ncm": None, "cfop": None, "cst": None}
+                    ncm, cfop, cst = self._ncm_cfop_cst_context(linhas, i, inicio, fim)
+                    item["ncm"], item["cfop"], item["cst"] = ncm, cfop, cst
+                    itens.append(self._normalize_item(item))
+                    for tp in ("ICMS","IPI","PIS","COFINS"):
+                        ali = self._aliquota_contexto(linhas, i, inicio, fim, tp)
+                        if ali is not None:
+                            impostos.append({"item_idx": item_idx_counter, "tipo_imposto": tp, "aliquota": ali})
+                    item_idx_counter += 1
+                    continue
+            # 2) Linha espaçada com regex rígida
             m = self.RE_ITEM_LINHA.search(linha)
             if m:
                 gd = m.groupdict()
-                item = {"descricao": _norm_ws(gd.get("desc","")), "unidade": gd.get("unid"), "quantidade": _to_float_br(gd.get("qtd")), "valor_unitario": _to_float_br(gd.get("vun")), "valor_total": _to_float_br(gd.get("vtot")), "ncm": None, "cfop": None, "cst": None}
+                desc = _norm_ws(gd.get("desc",""))
+                cod  = self._inferir_codigo_produto(desc)
+                item = {"descricao": desc, "codigo_produto": cod, "unidade": gd.get("unid"), "quantidade": _to_float_br(gd.get("qtd")), "valor_unitario": _to_float_br(gd.get("vun")), "valor_total": _to_float_br(gd.get("vtot")), "ncm": None, "cfop": None, "cst": None}
                 ncm, cfop, cst = self._ncm_cfop_cst_context(linhas, i, inicio, fim)
                 item["ncm"], item["cfop"], item["cst"] = ncm, cfop, cst
-                itens.append(item)
+                itens.append(self._normalize_item(item))
                 for tp in ("ICMS","IPI","PIS","COFINS"):
                     ali = self._aliquota_contexto(linhas, i, inicio, fim, tp)
                     if ali is not None:
                         impostos.append({"item_idx": item_idx_counter, "tipo_imposto": tp, "aliquota": ali})
                 item_idx_counter += 1; continue
+            # 3) Colunas por múltiplos espaços
             cols = re.split(r"\s{2,}", linha)
             if len(cols) >= 4:
                 desc = cols[0]
+                cod  = self._inferir_codigo_produto(desc)
                 qtd  = _to_float_br(cols[-3])
                 vun  = _to_float_br(cols[-2])
                 vtot = _to_float_br(cols[-1])
@@ -914,10 +1085,10 @@ class AgenteNLP:
                     un = cols[-4]
                 elif len(cols) >= 2 and re.fullmatch(r"[A-Z]{1,4}", cols[1] or ""):
                     un = cols[1]
-                it = {"descricao": _norm_ws(desc), "unidade": un, "quantidade": qtd, "valor_unitario": vun, "valor_total": vtot, "ncm": None, "cfop": None, "cst": None}
+                it = {"descricao": _norm_ws(desc), "codigo_produto": cod, "unidade": un, "quantidade": qtd, "valor_unitario": vun, "valor_total": vtot, "ncm": None, "cfop": None, "cst": None}
                 ncm, cfop, cst = self._ncm_cfop_cst_context(linhas, i, inicio, fim)
                 it["ncm"], it["cfop"], it["cst"] = ncm, cfop, cst
-                itens.append(it)
+                itens.append(self._normalize_item(it))
                 for tp in ("ICMS","IPI","PIS","COFINS"):
                     ali = self._aliquota_contexto(linhas, i, inicio, fim, tp)
                     if ali is not None:
@@ -935,6 +1106,7 @@ class AgenteNLP:
             nxt   = self.RE_MOEDA_BR.findall(linhas[i+1]) if i+1 < len(linhas) else []
             if len(found) >= 2 or (len(found) == 1 and len(nxt) >= 1):
                 desc = re.split(self.RE_MOEDA_BR.pattern, ln)[0].strip()
+                cod  = self._inferir_codigo_produto(desc)
                 un = None; qtd = None
                 qtd_m = re.search(r"(\d+(?:[\.,]\d{1,3})?)\s*(?:UN|UND|UNID|PC|PÇ|CX|KG|LT|UNIDADE|UNID\.)?", ln, re.I)
                 if qtd_m:
@@ -945,10 +1117,10 @@ class AgenteNLP:
                 if len(valores) >= 2:
                     vun  = _to_float_br(valores[-2])
                     vtot = _to_float_br(valores[-1])
-                    item = {"descricao": _norm_ws(desc) or None, "unidade": un, "quantidade": qtd, "valor_unitario": vun, "valor_total": vtot, "ncm": None, "cfop": None, "cst": None}
+                    item = {"descricao": _norm_ws(desc) or None, "codigo_produto": cod, "unidade": un, "quantidade": qtd, "valor_unitario": vun, "valor_total": vtot, "ncm": None, "cfop": None, "cst": None}
                     ncm, cfop, cst = self._ncm_cfop_cst_context(linhas, i, 0, len(linhas))
                     item["ncm"], item["cfop"], item["cst"] = ncm, cfop, cst
-                    itens.append(item)
+                    itens.append(self._normalize_item(item))
                     for tp in ("ICMS","IPI","PIS","COFINS"):
                         ali = self._aliquota_contexto(linhas, i, 0, len(linhas), tp)
                         if ali is not None:
@@ -956,68 +1128,120 @@ class AgenteNLP:
                     item_idx_counter += 1
         return itens, impostos
 
-    def _ncm_cfop_cst_context(self, linhas: List[str], i: int, inicio: int, fim: int) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        linha_anterior = linhas[i - 1].strip() if (i - 1) >= inicio else ""
-        linha_seguinte = linhas[i + 1].strip() if (i + 1) < fim else ""
-        ncm = (self.RE_NCM_ITEM.search(linhas[i] or "") or self.RE_NCM_ITEM.search(linha_seguinte) or self.RE_NCM_ITEM.search(linha_anterior))
-        cfop = (self.RE_CFOP_ITEM.search(linhas[i] or "") or self.RE_CFOP_ITEM.search(linha_seguinte) or self.RE_CFOP_ITEM.search(linha_anterior))
-        cst = (self.RE_CST_ITEM.search(linhas[i] or "") or self.RE_CST_ITEM.search(linha_seguinte) or self.RE_CST_ITEM.search(linha_anterior))
-        return (ncm.group(1) if ncm else None, cfop.group(1) if cfop else None, cst.group(1) if cst else None)
+    # -------------------- Tratativas avançadas de itens --------------------
+    def _normalize_item(self, it: Dict[str, Any]) -> Dict[str, Any]:
+        d = dict(it or {})
+        d["descricao"] = _norm_ws(str(d.get("descricao") or "")) or None
+        if d.get("unidade"):
+            u = str(d["unidade"]).strip().upper()
+            d["unidade"] = u if re.fullmatch(r"[A-Z]{1,4}", u) else self._inferir_unidade(u)
+        for k in ("quantidade","valor_unitario","valor_total"):
+            if d.get(k) is not None:
+                try:
+                    d[k] = _to_float_br(str(d[k]))
+                except Exception:
+                    d[k] = None
+        for k in ("ncm","cfop","cst","codigo_produto"):
+            if d.get(k) is not None:
+                d[k] = re.sub(r"[^A-Za-z0-9\-\.]", "", str(d[k])).strip() or None
+        # Completar valor_total se faltar
+        d = self._compute_missing_item_values(d)
+        return d
 
-    def _aliquota_contexto(self, linhas: List[str], i: int, inicio: int, fim: int, imposto: str) -> Optional[float]:
-        pad = re.compile(fr"{imposto}\s*[:\-]?\s*([0-9]+,[0-9]{{2}})\s*%?", re.I)
-        for ln in (linhas[i], linhas[i+1] if i+1<fim else "", linhas[i-1] if i-1>=inicio else ""):
-            m = pad.search(ln or "")
-            if m: return _to_float_br(m.group(1))
+    def _compute_missing_item_values(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        q = d.get("quantidade"); vu = d.get("valor_unitario"); vt = d.get("valor_total")
+        if vt is None and (q is not None and vu is not None):
+            try:
+                d["valor_total"] = round(float(q) * float(vu), 2)
+            except Exception:
+                pass
+        # Ajuste de ruído: se vt existe e q existe, mas vu não, calcule vu
+        if d.get("valor_unitario") is None and d.get("valor_total") is not None and d.get("quantidade"):
+            try:
+                q = float(d["quantidade"])
+                if q > 0:
+                    d["valor_unitario"] = round(float(d["valor_total"]) / q, 4)
+            except Exception:
+                pass
+        return d
+
+    def _inferir_codigo_produto(self, desc: Optional[str]) -> Optional[str]:
+        if not desc: return None
+        # Padrões comuns: "12345 - NOME", "COD 1234 NOME", "EAN 789..."
+        m = re.search(r"^\s*([A-Z0-9\-\.]{3,30})\s*[-–]\s+", desc, re.I)
+        if m: return m.group(1)
+        m2 = self.RE_COD_ITEM.search(desc or "")
+        if m2: return m2.group(2)
         return None
 
-    # =============== Validação & Sanitização (NLP) ===============
-    def _valor_valido_para_chave(self, k: str, v: Any) -> bool:
-        if v in (None, "", []): return False
-        try:
-            if k in ("emitente_cnpj", "destinatario_cnpj", "cnpj_autorizado"):
-                d = _only_digits(str(v)); return bool(d and len(d) >= 14)
-            if k in ("emitente_cpf", "destinatario_cpf"):
-                d = _only_digits(str(v)); return bool(d and len(d) == 11)
-            if k.startswith("data_"):
-                return _parse_date_like(str(v)) is not None
-            if k.startswith("valor_") or k.startswith("total_"):
-                if isinstance(v, (int, float)): return float(v) >= 0
-                return _to_float_br(str(v)) is not None
-        except Exception:
-            return False
-        return True
+    def _inferir_unidade(self, token: Optional[str]) -> Optional[str]:
+        if not token: return None
+        tok = str(token).strip().upper()
+        map_un = {
+            "UND":"UN", "UNID":"UN", "UNIDADE":"UN", "PÇ":"PC", "PC.":"PC",
+            "L":"LT", "LITRO":"LT", "LTS":"LT", "LTS.":"LT"
+        }
+        if tok in map_un: return map_un[tok]
+        if re.fullmatch(r"[A-Z]{1,4}", tok): return tok
+        return None
 
-    def _soma_valor_itens(self, itens: List[Dict[str, Any]]) -> Optional[float]:
-        soma = 0.0; ok = False
+    def _consolidar_itens_repetidos(self, itens: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        acc: Dict[Tuple[str,str,Optional[str]], Dict[str, Any]] = {}
         for it in itens or []:
-            v = it.get("valor_total")
-            if isinstance(v, (int, float)):
-                soma += float(v); ok = True
-            elif v:
-                fv = _to_float_br(str(v))
-                if fv is not None:
-                    soma += fv; ok = True
-        return round(soma, 2) if ok else None
+            key = (it.get("codigo_produto") or "", it.get("descricao") or "", it.get("ncm"))
+            if key not in acc:
+                acc[key] = dict(it)
+            else:
+                agg = acc[key]
+                # soma quantidade e total; unitário recalcula por média ponderada (quando possível)
+                try:
+                    q1 = float(agg.get("quantidade") or 0.0); q2 = float(it.get("quantidade") or 0.0)
+                    vt1 = float(agg.get("valor_total") or 0.0); vt2 = float(it.get("valor_total") or 0.0)
+                    agg["quantidade"] = round(q1 + q2, 4)
+                    agg["valor_total"] = round(vt1 + vt2, 2)
+                    if agg["quantidade"] and agg["valor_total"] is not None:
+                        agg["valor_unitario"] = round(agg["valor_total"] / agg["quantidade"], 4)
+                except Exception:
+                    pass
+        return list(acc.values())
 
-    def _sanear_dados(self, d: Dict[str, Any]) -> Dict[str, Any]:
-        out = dict(d)
-        for k in ("emitente_cnpj", "destinatario_cnpj", "cnpj_autorizado", "emitente_cpf", "destinatario_cpf"):
-            if out.get(k): out[k] = _only_digits(str(out[k])) or None
-        for k in [c for c in out.keys() if c.startswith("data_")]:
-            if out.get(k): out[k] = _parse_date_like(str(out[k]))
-        campos_valor = [
-            "valor_total","total_produtos","total_servicos","total_icms","total_ipi",
-            "total_pis","total_cofins","valor_iss","valor_descontos","valor_outros",
-            "valor_frete","valor_liquido",
-        ]
-        for k in campos_valor:
-            if out.get(k) is not None:
-                out[k] = float(out[k]) if isinstance(out[k], (int, float)) else _to_float_br(str(out[k]))
-        for k, v in list(out.items()):
-            if isinstance(v, str) and not v.strip():
-                out[k] = None
-        return out
+    def _pos_tratamento_itens(self, itens_in: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not itens_in: return []
+        norm = [self._normalize_item(x) for x in itens_in]
+        norm = [x for x in norm if (x.get("descricao") and (x.get("valor_total") is not None or x.get("quantidade") is not None))]
+        if not norm: return []
+        # consolida repetidos
+        norm = self._consolidar_itens_repetidos(norm)
+        # revalida totais
+        for it in norm:
+            self._compute_missing_item_values(it)
+        return norm
+
+    def _inferir_campos_globais_por_itens(self, campos: Dict[str, Any], itens: List[Dict[str, Any]]) -> None:
+        def majority(field: str) -> Optional[str]:
+            freq: Dict[str,int] = {}
+            for it in itens or []:
+                v = (it.get(field) or "").strip()
+                if not v: continue
+                freq[v] = freq.get(v, 0) + 1
+            if not freq: return None
+            v, c = max(freq.items(), key=lambda kv: kv[1])
+            return v if c >= 2 else None  # exige ao menos 2 ocorrências
+        if not campos.get("ncm"):
+            m = majority("ncm")
+            if m:
+                campos["ncm"] = m
+                self._add_explanation("ncm", method="majority_items", confidence=0.7, evidence=m)
+        if not campos.get("cfop"):
+            m = majority("cfop")
+            if m:
+                campos["cfop"] = m
+                self._add_explanation("cfop", method="majority_items", confidence=0.7, evidence=m)
+        if not campos.get("cst"):
+            m = majority("cst")
+            if m:
+                campos["cst"] = m
+                self._add_explanation("cst", method="majority_items", confidence=0.65, evidence=m)
 
     # ================== Pré-normalização OCR ==================
     def _pre_normalize_ocr(self, texto: str) -> str:
@@ -1068,15 +1292,63 @@ class AgenteNLP:
         vt = campos.get("valor_total")
         soma_it = self._soma_valor_itens(itens)
         if vt and soma_it:
-            checks["total_consistente_com_itens"] = abs(float(vt) - float(soma_it)) <= max(1.0, 0.25 * float(vt))  # (±25%) como “bom sinal”
+            checks["total_consistente_com_itens"] = abs(float(vt) - float(soma_it)) <= max(1.0, 0.25 * float(vt))
         else:
             checks["total_consistente_com_itens"] = None
         checks["emitente_cnpj_ok"] = bool(_only_digits(str(campos.get("emitente_cnpj") or "")) and len(_only_digits(str(campos.get("emitente_cnpj") or ""))) >= 14)
-        checks["destinatario_cnpj_ok"] = bool(_only_digits(str(campos.get("destinatario_cnpj") or "")) and len(_only_digits(str(campos.get("destinatario_cnpj") or ""))) >= 14) or bool(_only_digits(str(campos.get("destinatario_cpf") or "")) and len(_only_digits(str(campos.get("destinatario_cpf") or ""))) == 11)
+        checks["destinatario_cnpj_ok"] = bool(_only_digits(str(campos.get("destinatario_cnpj") or "")) and len(_only_digits(str(campos.get("destinatario_cnpj") or ""))) >= 14) \
+                                         or bool(_only_digits(str(campos.get("destinatario_cpf") or "")) and len(_only_digits(str(campos.get("destinatario_cpf") or ""))) == 11)
         checks["data_emissao_ok"] = campos.get("data_emissao") is not None
         checks["tem_itens"] = bool(itens)
         checks["tem_impostos"] = bool(impostos)
         return checks
+    
+    # =============== Validação & Sanitização (NLP) ===============
+    def _valor_valido_para_chave(self, k: str, v: Any) -> bool:
+        if v in (None, "", []): return False
+        try:
+            if k in ("emitente_cnpj", "destinatario_cnpj", "cnpj_autorizado"):
+                d = _only_digits(str(v)); return bool(d and len(d) >= 14)
+            if k in ("emitente_cpf", "destinatario_cpf"):
+                d = _only_digits(str(v)); return bool(d and len(d) == 11)
+            if k.startswith("data_"):
+                return _parse_date_like(str(v)) is not None
+            if k.startswith("valor_") or k.startswith("total_"):
+                if isinstance(v, (int, float)): return float(v) >= 0
+                return _to_float_br(str(v)) is not None
+        except Exception:
+            return False
+
+    def _soma_valor_itens(self, itens: List[Dict[str, Any]]) -> Optional[float]:
+        soma = 0.0; ok = False
+        for it in itens or []:
+            v = it.get("valor_total")
+            if isinstance(v, (int, float)):
+                soma += float(v); ok = True
+            elif v:
+                fv = _to_float_br(str(v))
+                if fv is not None:
+                    soma += fv; ok = True
+        return round(soma, 2) if ok else None
+
+    def _sanear_dados(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(d)
+        for k in ("emitente_cnpj", "destinatario_cnpj", "cnpj_autorizado", "emitente_cpf", "destinatario_cpf"):
+            if out.get(k): out[k] = _only_digits(str(out[k])) or None
+        for k in [c for c in out.keys() if c.startswith("data_")]:
+            if out.get(k): out[k] = _parse_date_like(str(out[k]))
+        campos_valor = [
+            "valor_total","total_produtos","total_servicos","total_icms","total_ipi",
+            "total_pis","total_cofins","valor_iss","valor_descontos","valor_outros",
+            "valor_frete","valor_liquido",
+        ]
+        for k in campos_valor:
+            if out.get(k) is not None:
+                out[k] = float(out[k]) if isinstance(out[k], (int, float)) else _to_float_br(str(out[k]))
+        for k, v in list(out.items()):
+            if isinstance(v, str) and not v.strip():
+                out[k] = None
+        return out
 
     # =================== Autoaprendizado (layout) ===================
     def _update_layout_memory(self, layout_hash: str, doc_tipo: str, fused: Dict[str, Any]) -> None:

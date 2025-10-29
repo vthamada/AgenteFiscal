@@ -1,4 +1,5 @@
 # agentes/agente_analitico.py
+
 from __future__ import annotations
 import builtins
 import hashlib
@@ -10,7 +11,6 @@ import time
 import traceback
 from contextlib import redirect_stdout
 from typing import Any, Dict, TYPE_CHECKING, Tuple
-
 import pandas as pd
 
 if TYPE_CHECKING:

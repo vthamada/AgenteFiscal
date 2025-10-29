@@ -10,9 +10,11 @@ easyocr
 torch
 torchvision
 pypdfium2
+langchain
 langchain-core
 langchain-openai
 langchain-google-genai
+langgraph
 pytest
 pytest-cov
 pytest-html

@@ -6,6 +6,7 @@ import time
 import logging
 import re
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable, Tuple
 
@@ -56,11 +57,9 @@ except Exception:
 # ------------------------------------------------------------
 _LG_AVAILABLE = False
 try:
-    # langgraph>=0.2.x
     from langgraph.graph import StateGraph, END  # type: ignore
     _LG_AVAILABLE = True
 except Exception:
-    # Executa em modo determinístico se não houver LangGraph
     pass
 
 
@@ -71,10 +70,12 @@ class Orchestrator:
     """
     Coordena ingestão e processamento fiscal (XML/OCR→NLP→normalização→associação→validação),
     com grafo cognitivo (LangGraph) se disponível. Fallback determinístico seguro se não.
+
     Agora com:
-      - Blackboard compartilhado
-      - Decisões adaptativas baseadas em confiança/cobertura/sanidade
-      - Logs explicativos e ciclo de feedback com memória/métricas
+      - Blackboard compartilhado e inspecionável
+      - Decisões adaptativas por confiança/cobertura/sanidade
+      - OCR adaptativo (2º passe agressivo quando suportado) + LLM gating
+      - Logs explicativos e memória/telemetria
     """
 
     db: "BancoDeDados"
@@ -88,6 +89,7 @@ class Orchestrator:
     OCR_CONF_STRONG: float = float(os.getenv("OCR_CONF_STRONG", "0.90"))
     OCR_CONF_MEDIUM: float = float(os.getenv("OCR_CONF_MEDIUM", "0.70"))
     NORMALIZER_SANITY_MIN: float = float(os.getenv("NORMALIZER_SANITY_MIN", "0.80"))
+    MAX_LLM_LOOPS: int = int(os.getenv("MAX_LLM_LOOPS", "2"))  # NOVO: controla refinamentos
 
     # Campos críticos p/ considerar “útil”
     CRITICAL_FIELDS: Tuple[str, ...] = ("emitente_cnpj", "valor_total", "data_emissao")
@@ -101,7 +103,6 @@ class Orchestrator:
     ):
         self.db = db
         self.validador = validador or ValidadorFiscal()
-        # FIX: MemoriaSessao requer db
         self.memoria = memoria or MemoriaSessao(self.db)
         self.llm = llm
         self.metrics_agent = MetricsAgent(llm=self.llm)
@@ -110,7 +111,7 @@ class Orchestrator:
         self.xml_agent = AgenteXMLParser(self.db, self.validador, self.metrics_agent)
         self.ocr_agent = AgenteOCR(llm=self.llm)
         self.nlp_agent = AgenteNLP(llm=self.llm)
-        # FIX: não passar keep_context_copy= no call (bug histórico)
+        # FIX: não passar keep_context_copy no call
         self.normalizador = AgenteNormalizadorCampos(
             llm=self.llm,
             enable_llm=True if self.llm else False,
@@ -120,14 +121,7 @@ class Orchestrator:
         self.analitico = AgenteAnalitico(self.llm, self.memoria) if (self.llm and _LC_AVAILABLE) else None
 
         # Blackboard compartilhado (memória de execução do documento)
-        self.blackboard: Dict[str, Dict[str, Any]] = {
-            "ocr": {},
-            "nlp": {},
-            "normalizer": {},
-            "validator": {},
-            "associador": {},
-            "decisions": {"log": []},
-        }
+        self.blackboard: Dict[str, Dict[str, Any]] = self._novo_blackboard()
 
         # Tools/Planner (LangChain) - opcional
         self._lc_tools: List[Any] = []
@@ -154,103 +148,67 @@ class Orchestrator:
             log.info("Orchestrator: executando sem LLM (modo determinístico/robusto).")
 
     # --------------------------------------------------------
+    # Gestão de thresholds (tuning em runtime)
+    # --------------------------------------------------------
+    def set_thresholds(
+        self,
+        *,
+        coverage_min: Optional[float] = None,
+        ocr_conf_strong: Optional[float] = None,
+        ocr_conf_medium: Optional[float] = None,
+        normalizer_sanity_min: Optional[float] = None,
+        max_llm_loops: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Ajusta thresholds sem redeploy."""
+        if coverage_min is not None:
+            self.COVERAGE_THRESHOLD = float(coverage_min)
+        if ocr_conf_strong is not None:
+            self.OCR_CONF_STRONG = float(ocr_conf_strong)
+        if ocr_conf_medium is not None:
+            self.OCR_CONF_MEDIUM = float(ocr_conf_medium)
+        if normalizer_sanity_min is not None:
+            self.NORMALIZER_SANITY_MIN = float(normalizer_sanity_min)
+        if max_llm_loops is not None:
+            self.MAX_LLM_LOOPS = int(max_llm_loops)
+        return {
+            "COVERAGE_THRESHOLD": self.COVERAGE_THRESHOLD,
+            "OCR_CONF_STRONG": self.OCR_CONF_STRONG,
+            "OCR_CONF_MEDIUM": self.OCR_CONF_MEDIUM,
+            "NORMALIZER_SANITY_MIN": self.NORMALIZER_SANITY_MIN,
+            "MAX_LLM_LOOPS": self.MAX_LLM_LOOPS,
+        }
+
+    # --------------------------------------------------------
     # Lista branca de colunas válidas (fallback)
     # --------------------------------------------------------
     _DOC_COLS_BASE = {
-        "id",
-        "status",
-        "motivo_rejeicao",
-        "meta_json",
-
-        # Identificação básica
-        "tipo",
-        "chave_acesso",
-        "modelo",
-        "serie",
-        "numero_nota",
-        "natureza_operacao",
-
-        # Datas/Horas
-        "data_emissao",
-        "data_saida",
-        "hora_emissao",
-        "hora_saida",
-
-        # Emitente
-        "emitente_cnpj",
-        "emitente_cpf",
-        "emitente_nome",
-        "emitente_ie",
-        "emitente_im",
-        "emitente_endereco",
-        "emitente_municipio",
-        "emitente_uf",
-
-        # Destinatário
-        "destinatario_cnpj",
-        "destinatario_cpf",
-        "destinatario_nome",
-        "destinatario_ie",
-        "destinatario_im",
-        "destinatario_endereco",
-        "destinatario_municipio",
-        "destinatario_uf",
-
-        # Totais (cabeçalho)
-        "valor_total",
-        "total_produtos",
-        "total_servicos",
-        "total_icms",
-        "total_ipi",
-        "total_pis",
-        "total_cofins",
-        "valor_iss",
-        "valor_descontos",
-        "valor_outros",
-        "valor_frete",
-        "valor_seguro",
-        "valor_liquido",
-
-        # Pagamento (novo)
-        "condicao_pagamento",
-        "meio_pagamento",
-        "bandeira_cartao",
-        "valor_troco",
-
-        # Transporte / volumes (opcional)
-        "modalidade_frete",
-        "placa_veiculo",
-        "uf_veiculo",
-        "peso_bruto",
-        "peso_liquido",
-        "qtd_volumes",
-
-        # Arquivo & identificação
-        "caminho_arquivo",
-        "nome_arquivo",
-        "origem",
-        "ambiente",
-
-        # XML e autorização (novo)
-        "caminho_xml",
-        "versao_schema",
-        "protocolo_autorizacao",
-        "data_autorizacao",
-        "cstat",
-        "xmotivo",
-        "responsavel_tecnico",
-
-        # Rótulos úteis (mantenha apenas se usa no cabeçalho)
-        "cfop",
-        "ncm",
-        "cst",
-        "cnpj_autorizado",
-        "observacoes",
+        "id","status","motivo_rejeicao","meta_json",
+        "tipo","chave_acesso","modelo","serie","numero_nota","natureza_operacao",
+        "data_emissao","data_saida","hora_emissao","hora_saida",
+        "emitente_cnpj","emitente_cpf","emitente_nome","emitente_ie","emitente_im","emitente_endereco","emitente_municipio","emitente_uf",
+        "destinatario_cnpj","destinatario_cpf","destinatario_nome","destinatario_ie","destinatario_im","destinatario_endereco","destinatario_municipio","destinatario_uf",
+        "valor_total","total_produtos","total_servicos","total_icms","total_ipi","total_pis","total_cofins","valor_iss","valor_descontos","valor_outros","valor_frete","valor_seguro","valor_liquido",
+        "condicao_pagamento","meio_pagamento","bandeira_cartao","valor_troco",
+        "modalidade_frete","placa_veiculo","uf_veiculo","peso_bruto","peso_liquido","qtd_volumes",
+        "caminho_arquivo","nome_arquivo","origem","ambiente",
+        "caminho_xml","versao_schema","protocolo_autorizacao","data_autorizacao","cstat","xmotivo","responsavel_tecnico",
+        "cfop","ncm","cst","cnpj_autorizado","observacoes",
     }
 
     # --------------------------------------------------------
     # Utils internos
     # --------------------------------------------------------
+    @staticmethod
+    def _novo_blackboard() -> Dict[str, Dict[str, Any]]:
+        return {
+            "ocr": {},
+            "nlp": {},
+            "normalizer": {},
+            "validator": {},
+            "associador": {},
+            "decisions": {"log": []},
+        }
+
     def _campos_permitidos_documentos(self) -> set:
         """Tenta descobrir as colunas reais via PRAGMA; senão usa fallback fixo."""
         try:
@@ -324,10 +282,7 @@ class Orchestrator:
             log.debug(f"Falha ao atualizar meta_json doc_id={doc_id}: {e}")
 
     def _persistir_detalhes_contexto(self, doc_id: int, contexto: Dict[str, Any]) -> None:
-        """
-        Grava pares chave/valor em documentos_detalhes quando disponível.
-        Aceita níveis (ex.: context['fallbacks']).
-        """
+        """Grava pares chave/valor em documentos_detalhes quando disponível (flattens recursivo)."""
         try:
             cur = self.db.conn.cursor()
             cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='documentos_detalhes' LIMIT 1")
@@ -364,7 +319,6 @@ class Orchestrator:
     # --------------------------------------------------------
     def _bb_write(self, section: str, data: Dict[str, Any]) -> None:
         self.blackboard.setdefault(section, {})
-        # deep merge simples
         for k, v in (data or {}).items():
             if isinstance(v, dict) and isinstance(self.blackboard[section].get(k), dict):
                 self.blackboard[section][k].update(v)
@@ -377,6 +331,30 @@ class Orchestrator:
             entry.update(extra)
         self.blackboard["decisions"]["log"].append(entry)
         log.info("[CognitiveDecision] %s", message)
+
+    def exportar_blackboard(self) -> Dict[str, Any]:
+        """Snapshot seguro do blackboard atual (para API/UI)."""
+        snap = deepcopy(self.blackboard)
+        # evitar payload gigante no snapshot
+        if "ocr" in snap and "data" in snap["ocr"] and isinstance(snap["ocr"]["data"].get("texto"), str):
+            snap["ocr"]["data"]["texto"] = f"[len={len(snap['ocr']['data']['texto'])} chars]"
+        return snap
+
+    def explicacao_decisoria(self) -> str:
+        """Resumo humano das decisões do meta-agente para auditoria."""
+        lines = []
+        decs = self.blackboard.get("decisions", {}).get("log", [])
+        if not decs:
+            return "Sem decisões cognitivas registradas para este documento."
+        for d in decs:
+            t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(d.get("ts", time.time())))
+            msg = d.get("msg", "")
+            extras = {k: v for k, v in d.items() if k not in {"ts", "msg"}}
+            if extras:
+                lines.append(f"[{t}] {msg} | {json.dumps(extras, ensure_ascii=False)}")
+            else:
+                lines.append(f"[{t}] {msg}")
+        return "\n".join(lines)
 
     # --------------------------------------------------------
     # Heurísticas / checagens
@@ -405,11 +383,8 @@ class Orchestrator:
         ok_cnpj = bool(campos.get("emitente_cnpj"))
         ok_valor = campos.get("valor_total") is not None
         ok_data = bool(campos.get("data_emissao"))
-
-        # Novo: identificação forte alternativa
         ok_chave = bool(campos.get("chave_acesso"))
         id_tripla = bool(campos.get("modelo")) and bool(campos.get("serie")) and bool(campos.get("numero_nota"))
-
         completo = (ok_valor and ok_data) and (ok_cnpj or ok_chave or id_tripla)
 
         if xml_encontrado and completo:
@@ -421,10 +396,7 @@ class Orchestrator:
         return {"status": "revisao_pendente", "fonte": "baixa_confianca"}
 
     def _regex_minima_completar(self, texto: str, campos: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Último recurso: captura pistas soltas (IE/município/endereço) via regex simples.
-        Não grava no cabeçalho; coloca em __context__.fallbacks.* para auditoria/aproveitamento posterior.
-        """
+        """Último recurso: pistas soltas via regex simples → __context__.fallbacks.*"""
         try:
             def _rx(p, flags=re.I | re.M):
                 m = re.search(p, texto or "", flags)
@@ -436,7 +408,6 @@ class Orchestrator:
                 "endereco": _rx(r"endere[çc]o[:\s]*(.+)"),
             }
             fallbacks = {k: v for k, v in fallbacks.items() if v}
-
             if fallbacks:
                 ctx = campos.get("__context__", {})
                 ctx.setdefault("fallbacks", {}).update(fallbacks)
@@ -452,7 +423,6 @@ class Orchestrator:
 
         schema = getattr(self.nlp_agent, "schema_campos", [])
         schema_json = json.dumps(schema, ensure_ascii=False)
-
         prompt = (
             f"O documento não pôde ser processado normalmente ({motivo}).\n"
             "Extraia os campos fiscais estruturados de uma nota brasileira (NFe, NFCe, NFSe, CTe) a partir do texto.\n"
@@ -530,9 +500,7 @@ class Orchestrator:
             try:
                 data = _tool_parse_input(input_str)
                 campos = data.get("campos") or {}
-                out = self.normalizador.normalizar(
-                    dict(campos)  # FIX: sem keep_context_copy kwarg
-                )
+                out = self.normalizador.normalizar(dict(campos))
                 return json.dumps({"ok": True, "campos": out}, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({"ok": False, "erro": f"Normalizador: {e}"}, ensure_ascii=False)
@@ -601,17 +569,93 @@ class Orchestrator:
                 self._lc_agent = None
 
     # --------------------------------------------------------
+    # OCR adaptativo (helper interno)
+    # --------------------------------------------------------
+    def _ocr_adaptativo(self, nome: str, conteudo: bytes) -> Tuple[str, float, Dict[str, Any], List[Dict[str, Any]]]:
+        """
+        Executa OCR com 1º passe normal e, se necessário, 2º passe agressivo quando suportado.
+        Retorna: texto_escolhido, conf_escolhida, ocr_meta, decisions (lista para blackboard)
+        """
+        decisions: List[Dict[str, Any]] = []
+
+        # Passo 1
+        t0 = time.time()
+        texto1, conf1 = self.ocr_agent.reconhecer(nome, conteudo)
+        meta1 = getattr(self.ocr_agent, "last_stats", {}) or {}
+        dt1 = round(time.time() - t0, 3)
+
+        best_txt, best_conf, best_meta = texto1, float(conf1 or 0.0), meta1
+
+        # Critério para pass2
+        precisa_reforco = (best_conf < self.OCR_CONF_MEDIUM) or not (best_txt or "").strip()
+        if precisa_reforco:
+            # tenta “modo agressivo” de forma segura, sem exigir assinatura específica
+            texto2, conf2, meta2, ok_pass2 = None, None, {}, False
+
+            # Estratégia A: método dedicado se existir
+            try:
+                if hasattr(self.ocr_agent, "reconhecer_agressivo"):
+                    t1 = time.time()
+                    texto2, conf2 = self.ocr_agent.reconhecer_agressivo(nome, conteudo)  # type: ignore
+                    meta2 = getattr(self.ocr_agent, "last_stats", {}) or {}
+                    dt2 = round(time.time() - t1, 3)
+                    ok_pass2 = True
+                    decisions.append({"msg": "OCR pass2 agressivo (método dedicado)", "duracao_s": dt2})
+            except Exception as e:
+                log.debug("OCR agressivo (dedicado) indisponível: %s", e)
+
+            # Estratégia B: parâmetro 'modo' se a assinatura aceitar
+            if not ok_pass2:
+                try:
+                    t1 = time.time()
+                    texto2, conf2 = self.ocr_agent.reconhecer(nome, conteudo, modo="agressivo")  # type: ignore
+                    meta2 = getattr(self.ocr_agent, "last_stats", {}) or {}
+                    dt2 = round(time.time() - t1, 3)
+                    ok_pass2 = True
+                    decisions.append({"msg": "OCR pass2 agressivo (param modo=agressivo)", "duracao_s": dt2})
+                except TypeError:
+                    # assinatura não aceita o parâmetro
+                    pass
+                except Exception as e:
+                    log.debug("OCR agressivo (modo) falhou: %s", e)
+
+            # Estratégia C: reexecutar normal (ruídos intermitentes)
+            if not ok_pass2:
+                try:
+                    t1 = time.time()
+                    texto2, conf2 = self.ocr_agent.reconhecer(nome, conteudo)
+                    meta2 = getattr(self.ocr_agent, "last_stats", {}) or {}
+                    dt2 = round(time.time() - t1, 3)
+                    ok_pass2 = True
+                    decisions.append({"msg": "OCR pass2 (reexecução normal)", "duracao_s": dt2})
+                except Exception as e:
+                    log.debug("OCR pass2 normal falhou: %s", e)
+
+            # Escolha do melhor
+            try:
+                c1 = float(conf1 or 0.0)
+                c2 = float(conf2 or 0.0) if conf2 is not None else -1.0
+                if c2 > c1 and (texto2 or "").strip():
+                    best_txt, best_conf, best_meta = texto2, c2, meta2
+                    decisions.append({"msg": "OCR escolheu pass2 (conf maior)", "conf2": c2, "conf1": c1})
+                else:
+                    decisions.append({"msg": "OCR manteve pass1", "conf1": c1, "conf2": c2})
+            except Exception:
+                pass
+
+        # Decisão de correção via LLM aplicada dentro do AgenteOCR (se houver)
+        if bool(best_meta.get("llm_correction_applied")):
+            decisions.append({"msg": "OCR aplicou LLM correction", "flag": True})
+
+        # Guarda meta de tempo do pass1
+        decisions.append({"msg": "OCR pass1 concluído", "duracao_s": dt1, "conf": best_conf})
+        return best_txt or "", float(best_conf or 0.0), best_meta, decisions
+
+    # --------------------------------------------------------
     # Grafo cognitivo (LangGraph)
     # --------------------------------------------------------
     def _build_langgraph(self):
-        """
-        Define um grafo de estados resiliente com loops de correção:
-        register -> ocr -> nlp -> (condicional) llm_refine -> normalize -> associate -> decide
-        -> validate -> persist -> metrics -> END
-        Alimenta o Blackboard e produz decisões explicativas.
-        """
-
-        # Estado compartilhado do grafo
+        """Define um grafo de estados resiliente com loops de correção."""
         def new_state() -> Dict[str, Any]:
             return {
                 "doc_id": -1,
@@ -632,7 +676,7 @@ class Orchestrator:
                 "erro": None,
                 "start_time": time.time(),
                 "loops": 0,
-                "max_loops": 2,  # controla quantas vezes podemos voltar ao LLM_refine
+                "max_loops": self.MAX_LLM_LOOPS,  # NOVO: do ENV/runtime
             }
 
         graph = StateGraph(dict, name="AgenteFiscalGraph")
@@ -670,24 +714,22 @@ class Orchestrator:
             conteudo = state["conteudo"]
             doc_id = state["doc_id"]
 
-            def _do_ocr() -> Tuple[str, float]:
-                return self.ocr_agent.reconhecer(nome, conteudo)
-
             try:
-                t0 = time.time()
-                texto, conf = self._retry(_do_ocr, attempts=2, backoff_s=0.6)
-                dt = time.time() - t0
-                state["texto_ocr"] = texto or ""
-                state["conf_ocr"] = float(conf or 0.0)
+                texto, conf, ocr_meta, ocr_decisions = self._ocr_adaptativo(nome, conteudo)
+                state["texto_ocr"] = texto
+                state["conf_ocr"] = conf
+                state["ocr_meta"] = ocr_meta or {}
 
-                # layout fingerprint para memória cognitiva
-                layout_fp = None
+                for d in ocr_decisions:
+                    self._bb_decision(d.get("msg", "OCR decisão"), stage="ocr", **{k: v for k, v in d.items() if k != "msg"})
+
+                # layout fingerprint (memória)
                 try:
-                    layout_fp = self.memoria.layout_fingerprint(texto or "")
+                    state["layout_fp"] = self.memoria.layout_fingerprint(texto or "")
                 except Exception:
-                    layout_fp = None
-                state["layout_fp"] = layout_fp
+                    state["layout_fp"] = None
 
+                # persist meta e extração resumida
                 if (texto or "").strip():
                     self.db.inserir_extracao(
                         documento_id=doc_id,
@@ -695,24 +737,19 @@ class Orchestrator:
                         confianca_media=float(conf),
                         texto_extraido=texto[:200000] + ("..." if len(texto) > 200000 else ""),
                         linguagem="pt",
-                        tempo_processamento=round(dt, 3),
+                        tempo_processamento=None,
                     )
                     ocr_tipo = "nativo" if conf >= 0.98 else "ocr"
-                    self._merge_meta_json(doc_id, {"ocr": {"tipo": ocr_tipo, "conf": float(conf), "duracao_s": round(dt, 3)}})
-                    # reforça meta detalhada do OCR quando disponível
+                    self._merge_meta_json(doc_id, {"ocr": {"tipo": ocr_tipo, "conf": float(conf)}})
                     try:
-                        self._merge_meta_json(doc_id, {"ocr_meta": getattr(self.ocr_agent, "last_stats", {}) or {}})
+                        self._merge_meta_json(doc_id, {"ocr_meta": ocr_meta or {}})
                     except Exception:
-                       pass
-                    self._bb_write("ocr", {"data": {"texto": f"[{len(texto)} chars]"}, "__meta__": {"avg_confidence": conf, "pages": None, "llm_correction_applied": bool(getattr(self.ocr_agent, "last_stats", {}).get("llm_correction_applied", False))}})
-                    # decisão adaptativa sobre reforço de OCR
-                    if conf < self.OCR_CONF_MEDIUM:
-                        self._bb_decision(f"OCR conf {conf:.2f} < {self.OCR_CONF_MEDIUM:.2f} → configurar NLP para LLM_full", stage="ocr")
+                        pass
+                    self._bb_write("ocr", {"data": {"texto": f"[{len(texto)} chars]"}, "__meta__": {"avg_confidence": conf, "llm_correction_applied": bool(ocr_meta.get("llm_correction_applied"))}})
                 else:
-                    pass
                     self.db.log("ocr_vazio", "AgenteOCR", f"doc_id={doc_id}|conf={conf:.2f}")
                     self._bb_decision("OCR retornou texto vazio → ativar LLM_full no NLP", stage="ocr")
-                state["ocr_meta"] = getattr(self.ocr_agent, "last_stats", {}) or {}
+
             except Exception as e:
                 state["erro"] = f"OCR falhou: {e}"
                 log.exception(state["erro"])
@@ -737,14 +774,16 @@ class Orchestrator:
                     state["meta_nlp"] = meta or {}
                     state["itens_ocr"] = campos.pop("itens_ocr", []) or []
                     state["impostos_ocr"] = campos.pop("impostos_ocr", []) or []
-                    # Fusão incremental (mantém o que já tem, preenche ausentes)
                     fusion = self.normalizador.fundir(state.get("campos") or {}, campos)
                     state["campos"] = fusion
 
                     cov = float(state["meta_nlp"].get("coverage", 0.0) or 0.0)
                     self._bb_write("nlp", {"data": {"campos": list(fusion.keys())}, "__meta__": {"coverage": cov, "source": state["meta_nlp"].get("source", "desconhecido")}})
                     if cov < self.COVERAGE_THRESHOLD or self._faltando_campos_criticos(fusion):
-                        self._bb_decision(f"NLP coverage {cov:.2f} < {self.COVERAGE_THRESHOLD:.2f} ou campos críticos faltando → ativar LLM_refine", stage="nlp", coverage=cov)
+                        self._bb_decision(
+                            f"NLP coverage {cov:.2f} < {self.COVERAGE_THRESHOLD:.2f} ou campos críticos faltando → ativar LLM_refine",
+                            stage="nlp", coverage=cov
+                        )
             except Exception as e:
                 log.warning("NLP falhou no grafo doc_id=%d: %s", doc_id, e)
             return state
@@ -752,7 +791,7 @@ class Orchestrator:
         def n_llm_refine(state: Dict[str, Any]) -> Dict[str, Any]:
             if state.get("erro") or not self.llm:
                 return state
-            if state.get("loops", 0) >= state.get("max_loops", 2):
+            if state.get("loops", 0) >= state.get("max_loops", self.MAX_LLM_LOOPS):
                 return state
 
             texto = state.get("texto_ocr") or ""
@@ -766,11 +805,7 @@ class Orchestrator:
                     campos_llm = extrair_llm(texto) or {}
                     meta_llm = campos_llm.pop("__meta__", {}) if isinstance(campos_llm, dict) else {}
                     try:
-                        vals = [
-                            float(v)
-                            for v in (meta_llm.values() if isinstance(meta_llm, dict) else [])
-                            if isinstance(v, (int, float, str))
-                        ]
+                        vals = [float(v) for v in (meta_llm.values() if isinstance(meta_llm, dict) else []) if isinstance(v, (int, float, str))]
                         conf_llm = sum(pd.to_numeric(pd.Series(vals), errors="coerce").fillna(0.0)) / max(len(vals) or 1, 1)
                     except Exception:
                         conf_llm = None
@@ -784,21 +819,18 @@ class Orchestrator:
                         tempo_processamento=0.0,
                     )
                 else:
-                    # fallback global
                     gl = self._processar_com_llm_fallback(texto if texto else state.get("conteudo", b""), motivo="grafo_refine")
                     campos_llm = {k: v for k, v in gl.items() if k != "__meta__"}
 
-                # Fusão
                 base = state.get("campos") or {}
                 fusion = self.normalizador.fundir(base, campos_llm)
                 state["campos"] = fusion
                 state["loops"] = int(state.get("loops", 0)) + 1
 
-                # último recurso: regex mínima
                 if self._faltando_campos_criticos(state["campos"]):
                     state["campos"] = self._regex_minima_completar(texto, state["campos"])
 
-                self._bb_decision("LLM refine executado para completar campos críticos/baixa cobertura", stage="nlp")
+                self._bb_decision("LLM refine executado para completar campos críticos/baixa cobertura", stage="nlp", loop=state["loops"])
             except Exception as e:
                 log.warning("LLM refine falhou no grafo doc_id=%d: %s", doc_id, e)
             return state
@@ -807,10 +839,7 @@ class Orchestrator:
             if state.get("erro"):
                 return state
             try:
-                campos_norm = self.normalizador.normalizar(
-                    self.normalizador.fundir(state.get("campos") or {})
-                )
-                # Se vier __context__, mandar para meta_json e (opcional) documentos_detalhes
+                campos_norm = self.normalizador.normalizar(self.normalizador.fundir(state.get("campos") or {}))
                 contexto = campos_norm.pop("__context__", None)
                 if contexto:
                     try:
@@ -820,15 +849,16 @@ class Orchestrator:
                         pass
                 state["campos"] = campos_norm
 
-                # score de sanidade do normalizador (se exposto em __meta__)
                 meta_norm = campos_norm.get("__meta__") if isinstance(campos_norm, dict) else None
                 sanity = None
                 if isinstance(meta_norm, dict):
                     sanity = meta_norm.get("sanity_score")
-                # registra no blackboard
                 self._bb_write("normalizer", {"__meta__": {"sanity_score": sanity}})
                 if isinstance(sanity, (int, float)) and float(sanity) < self.NORMALIZER_SANITY_MIN:
-                    self._bb_decision(f"Sanity {float(sanity):.2f} < {self.NORMALIZER_SANITY_MIN:.2f} → marcar revisão contextual", stage="normalize", sanity=float(sanity))
+                    self._bb_decision(
+                        f"Sanity {float(sanity):.2f} < {self.NORMALIZER_SANITY_MIN:.2f} → marcar revisão contextual",
+                        stage="normalize", sanity=float(sanity)
+                    )
             except Exception as e:
                 log.warning("Normalização falhou doc_id=%s: %s", state.get("doc_id"), e)
             return state
@@ -839,8 +869,26 @@ class Orchestrator:
             try:
                 doc_id = state["doc_id"]
                 texto = state.get("texto_ocr") or ""
-                campos_associados = self.associador.tentar_associar_pdf(doc_id, state.get("campos") or {}, texto_ocr=texto)
-                # Guardar assoc meta em meta_json e limpar do payload
+                campos_entrada = state.get("campos") or {}
+
+                # Tenta associação padrão
+                campos_associados = self.associador.tentar_associar_pdf(doc_id, campos_entrada, texto_ocr=texto)
+
+                # Heurística opcional: se ainda sem xml, tenta utilitários do XML agent se existirem
+                if not (campos_associados or {}).get("caminho_xml"):
+                    try:
+                        buscar_por = getattr(self.xml_agent, "buscar_por_chave_ou_tripla", None)
+                        if callable(buscar_por):
+                            chave = campos_entrada.get("chave_acesso")
+                            tripla = (campos_entrada.get("modelo"), campos_entrada.get("serie"), campos_entrada.get("numero_nota"))
+                            achou = buscar_por(chave=chave, tripla=tripla)
+                            if achou and isinstance(achou, dict):
+                                campos_associados = self.normalizador.fundir(campos_associados, achou)
+                                self._bb_decision("Associação XML por utilitário (chave/tripla) aplicada", stage="associate")
+                    except Exception:
+                        pass
+
+                # meta de associação → meta_json
                 assoc_meta = (campos_associados or {}).pop("__assoc_meta__", None)
                 if assoc_meta:
                     try:
@@ -848,7 +896,6 @@ class Orchestrator:
                     except Exception:
                         pass
                 state["campos"] = campos_associados
-                # blackboard
                 self._bb_write("associador", {"__meta__": {"match_score": (assoc_meta or {}).get("match_score") if isinstance(assoc_meta, dict) else None}})
             except Exception as e:
                 log.warning("Associação XML falhou doc_id=%s: %s", state.get("doc_id"), e)
@@ -940,7 +987,6 @@ class Orchestrator:
                 fonte_nlp = (state.get("meta_nlp") or {}).get("source", "desconhecido")
                 cov = float((state.get("meta_nlp") or {}).get("coverage", 0.0) or 0.0)
 
-                # meta_json
                 try:
                     self._merge_meta_json(doc_id, {
                         "nlp": {"source": fonte_nlp, "coverage": cov},
@@ -950,7 +996,6 @@ class Orchestrator:
                 except Exception:
                     pass
 
-                # status + log
                 try:
                     self.db.atualizar_documento_campo(doc_id, "status", state.get("status"))
                 except Exception:
@@ -962,7 +1007,6 @@ class Orchestrator:
                     f"doc_id={doc_id}|conf={avg_conf:.2f}|status={state.get('status')}|fonte={state.get('fonte')}|loops={state.get('loops')}",
                 )
 
-                # métricas agregadas
                 processing_time = time.time() - float(state.get("start_time") or time.time())
                 self.metrics_agent.registrar_metrica(
                     db=self.db,
@@ -972,7 +1016,6 @@ class Orchestrator:
                     tempo_medio=float(processing_time),
                 )
 
-                # ciclo de feedback (memória cognitiva)
                 sucesso = (state.get("status") in {"processado", "revisado"})
                 receita = {
                     "ocr": getattr(self.ocr_agent, "last_stats", {}),
@@ -987,7 +1030,6 @@ class Orchestrator:
                 }
                 layout_fp = state.get("layout_fp")
                 try:
-                    # grava receita por layout (com EMA)
                     if layout_fp:
                         self.memoria.registrar_layout_receita(
                             layout_fp=layout_fp,
@@ -995,7 +1037,6 @@ class Orchestrator:
                             fonte="orchestrator",
                             sucesso=sucesso
                         )
-                    # telemetria da execução
                     campos = state.get("campos") or {}
                     self.memoria.registrar_execucao(
                         doc_id=doc_id,
@@ -1015,8 +1056,7 @@ class Orchestrator:
 
         # ------------- CONDIÇÕES -------------
         def c_post_nlp(state: Dict[str, Any]) -> str:
-            # Se faltar campo crítico OU cobertura baixa, tenta refinar via LLM (até max_loops); senão segue
-            can_loop = state.get("loops", 0) < state.get("max_loops", 2)
+            can_loop = state.get("loops", 0) < state.get("max_loops", self.MAX_LLM_LOOPS)
             if self.llm and self._precisa_llm(state.get("campos") or {}, state.get("meta_nlp") or {}) and can_loop:
                 return "llm_refine"
             return "normalize"
@@ -1047,24 +1087,15 @@ class Orchestrator:
 
         compiled = graph.compile()
 
-        # wrapper para invocação
         def run_graph(nome: str, conteudo: bytes, origem: str) -> int:
-            # limpa blackboard por execução
-            self.blackboard = {
-                "ocr": {},
-                "nlp": {},
-                "normalizer": {},
-                "validator": {},
-                "associador": {},
-                "decisions": {"log": []},
-            }
+            self.blackboard = self._novo_blackboard()
             state = {
                 **new_state(),
                 "nome": nome,
                 "conteudo": conteudo,
                 "origem": origem,
             }
-            out = compiled.invoke(state)  # executa o grafo
+            out = compiled.invoke(state)
             return int(out.get("doc_id", -1) or -1)
 
         return run_graph
@@ -1092,11 +1123,9 @@ class Orchestrator:
                 doc_id = self.xml_agent.processar(nome, conteudo, origem)
             elif ext in {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}:
                 if callable(self._graph):
-                    # —— NOVO: usa grafo cognitivo
-                    doc_id = self._graph(nome, conteudo, origem)  # type: ignore
+                    doc_id = self._graph(nome, conteudo, origem)  # grafo cognitivo
                 else:
-                    # fallback determinístico antigo (ainda robusto)
-                    doc_id = self._processar_midias(nome, conteudo, origem)
+                    doc_id = self._processar_midias(nome, conteudo, origem)  # fallback
                 tipo_doc = Path(nome).suffix.lower().strip(".")
             else:
                 motivo = f"Extensão '{ext}' não suportada."
@@ -1170,56 +1199,33 @@ class Orchestrator:
         tipo_doc = Path(nome).suffix.lower().strip(".")
         fonte_final = "desconhecida"
 
-        # reset do blackboard para este documento
-        self.blackboard = {
-            "ocr": {},
-            "nlp": {},
-            "normalizer": {},
-            "validator": {},
-            "associador": {},
-            "decisions": {"log": []},
-        }
+        self.blackboard = self._novo_blackboard()
 
         try:
-            # 0) Registrar documento
+            # 0) Registrar
             doc_id = self.db.inserir_documento(
-                nome_arquivo=nome,
-                tipo=tipo_doc,
-                origem=origem,
-                hash=self.db.hash_bytes(conteudo),
-                status="processando",
-                data_upload=self.db.now(),
-                caminho_arquivo=str(self.db.save_upload(nome, conteudo)),
+                nome_arquivo=nome, tipo=tipo_doc, origem=origem,
+                hash=self.db.hash_bytes(conteudo), status="processando",
+                data_upload=self.db.now(), caminho_arquivo=str(self.db.save_upload(nome, conteudo)),
             )
             self._bb_write("decisions", {"doc_id": doc_id})
             log.info("Processando mídia '%s' (doc_id %d)", nome, doc_id)
 
-            # 1) OCR com retry
-            def _do_ocr() -> Tuple[str, float]:
-                return self.ocr_agent.reconhecer(nome, conteudo)
-
-            t_ocr_start = time.time()
-            texto, conf = self._retry(_do_ocr, attempts=2, backoff_s=0.6)
-            ocr_time = time.time() - t_ocr_start
-            ocr_tipo = "nativo" if conf >= 0.98 else "ocr"
-            ocr_meta = getattr(self.ocr_agent, "last_stats", {}) or {}
-
-            layout_fp = None
-            try:
-                layout_fp = self.memoria.layout_fingerprint(texto or "")
-            except Exception:
-                pass
-
-            if texto.strip():
+            # 1) OCR adaptativo
+            texto, conf, ocr_meta, ocr_decisions = self._ocr_adaptativo(nome, conteudo)
+            for d in ocr_decisions:
+                self._bb_decision(d.get("msg", "OCR decisão"), stage="ocr", **{k: v for k, v in d.items() if k != "msg"})
+            if (texto or "").strip():
                 self.db.inserir_extracao(
                     documento_id=doc_id,
                     agente="OCRAgent",
                     confianca_media=float(conf),
                     texto_extraido=texto[:200000] + ("..." if len(texto) > 200000 else ""),
                     linguagem="pt",
-                    tempo_processamento=round(ocr_time, 3),
+                    tempo_processamento=None,
                 )
-                self._merge_meta_json(doc_id, {"ocr": {"tipo": ocr_tipo, "conf": float(conf), "duracao_s": round(ocr_time, 3)}})
+                ocr_tipo = "nativo" if conf >= 0.98 else "ocr"
+                self._merge_meta_json(doc_id, {"ocr": {"tipo": ocr_tipo, "conf": float(conf)}})
                 self._bb_write("ocr", {"data": {"texto": f"[{len(texto)} chars]"}, "__meta__": {"avg_confidence": conf}})
                 if conf < self.OCR_CONF_MEDIUM:
                     self._bb_decision(f"OCR conf {conf:.2f} < {self.OCR_CONF_MEDIUM:.2f} → preparar LLM_full no NLP", stage="ocr")
@@ -1235,10 +1241,7 @@ class Orchestrator:
 
             if texto:
                 def _do_nlp() -> Tuple[Dict[str, Any]]:
-                    out = self.nlp_agent.extrair_campos({
-                        "texto_ocr": texto or "",
-                        "ocr_meta": ocr_meta or {}
-                    })
+                    out = self.nlp_agent.extrair_campos({"texto_ocr": texto or "", "ocr_meta": ocr_meta or {}})
                     return (out,)
                 try:
                     (campos,) = self._retry(_do_nlp, attempts=2, backoff_s=0.5)
@@ -1256,7 +1259,7 @@ class Orchestrator:
             if precisa_llm:
                 self._bb_decision("NLP insuficiente (coverage ou campos críticos) → executar LLM refine", stage="nlp")
 
-            # 3) Fallback LLM
+            # 3) LLM refine
             if precisa_llm and self.llm:
                 try:
                     extrair_llm = getattr(self.nlp_agent, "_extrair_campos_llm", None)
@@ -1288,9 +1291,7 @@ class Orchestrator:
                 campos_nlp = self._regex_minima_completar(texto, campos_nlp)
 
             # 4) Fusão & Normalização
-            campos_norm = self.normalizador.normalizar(
-                self.normalizador.fundir(campos_nlp)
-            )
+            campos_norm = self.normalizador.normalizar(self.normalizador.fundir(campos_nlp))
             contexto = campos_norm.pop("__context__", None)
             if contexto:
                 try:
@@ -1299,10 +1300,21 @@ class Orchestrator:
                 except Exception:
                     pass
 
-            # 5) Associação a XML existente
+            # 5) Associação a XML existente (com heurística opcional)
             campos_associados = self.associador.tentar_associar_pdf(doc_id, campos_norm, texto_ocr=texto)
-            # Assoc meta -> meta_json
             assoc_meta = (campos_associados or {}).pop("__assoc_meta__", None)
+            if not (campos_associados or {}).get("caminho_xml"):
+                try:
+                    buscar_por = getattr(self.xml_agent, "buscar_por_chave_ou_tripla", None)
+                    if callable(buscar_por):
+                        chave = campos_norm.get("chave_acesso")
+                        tripla = (campos_norm.get("modelo"), campos_norm.get("serie"), campos_norm.get("numero_nota"))
+                        achou = buscar_por(chave=chave, tripla=tripla)
+                        if achou and isinstance(achou, dict):
+                            campos_associados = self.normalizador.fundir(campos_associados, achou)
+                            self._bb_decision("Associação XML por utilitário (chave/tripla) aplicada", stage="associate")
+                except Exception:
+                    pass
             if assoc_meta:
                 try:
                     self._merge_meta_json(doc_id, {"associacao": assoc_meta})
@@ -1313,11 +1325,7 @@ class Orchestrator:
             # 6) Status por confiança
             tipo_detectado = (campos_associados.get("tipo") or "").lower().strip()
             caminho_xml = (campos_associados.get("caminho_xml") or "").strip()
-            xml_encontrado = bool(
-                caminho_xml
-                or ("xml" in tipo_detectado)
-                or tipo_detectado in {"nfe", "nfce", "cte", "nfse", "cfe"}
-            )
+            xml_encontrado = bool(caminho_xml or ("xml" in tipo_detectado) or tipo_detectado in {"nfe", "nfce", "cte", "nfse", "cfe"})
             rota = self._decidir_rota(conf_ocr=conf, campos=campos_associados, xml_encontrado=xml_encontrado)
             status_final = rota.get("status", "revisao_pendente")
             fonte_final = rota.get("fonte", "ocr/nlp")
@@ -1380,65 +1388,47 @@ class Orchestrator:
                 fonte_nlp = (meta_nlp or {}).get("source", "desconhecido")
                 cov = float((meta_nlp or {}).get("coverage", 0.0) or 0.0)
 
-                log.info(
-                    "OCR[%s] conf=%.2f | NLP src=%s cov=%.2f | Status=%s fonte=%s",
-                    nome, avg_conf, fonte_nlp, cov, status_final, fonte_final,
-                )
+                log.info("OCR[%s] conf=%.2f | NLP src=%s cov=%.2f | Status=%s fonte=%s", nome, avg_conf, fonte_nlp, cov, status_final, fonte_final)
                 self._merge_meta_json(doc_id, {
                     "nlp": {"source": fonte_nlp, "coverage": cov},
                     "pipeline": {"fonte_final": fonte_final, "status_final": status_final},
                     "blackboard": {"decisions": self.blackboard.get("decisions", {}).get("log", [])}
                 })
 
-                # ciclo de feedback memória/métricas
                 sucesso = (status_final in {"processado", "revisado"})
                 receita = {
                     "ocr": getattr(self.ocr_agent, "last_stats", {}),
                     "nlp": {"coverage": cov, "source": fonte_nlp},
                     "decisions": self.blackboard.get("decisions", {}).get("log", []),
                 }
-                metricas = {
-                    "coverage": cov,
-                    "confidence": avg_conf,
-                    "status": status_final,
-                    "fonte": fonte_final,
-                }
+                metricas = {"coverage": cov, "confidence": avg_conf, "status": status_final, "fonte": fonte_final}
+                layout_fp = state_layout_fp = None
+                try:
+                    state_layout_fp = self.memoria.layout_fingerprint(texto or "")
+                except Exception:
+                    pass
+                layout_fp = state_layout_fp
                 if layout_fp:
-                    self.memoria.registrar_layout_receita(
-                        layout_fp=layout_fp,
-                        receita=receita,
-                        fonte="orchestrator",
-                        sucesso=sucesso
-                    )
+                    self.memoria.registrar_layout_receita(layout_fp=layout_fp, receita=receita, fonte="orchestrator", sucesso=sucesso)
                 campos_final = campos_associados or {}
                 self.memoria.registrar_execucao(
-                    doc_id=doc_id,
-                    layout_fp=layout_fp,
+                    doc_id=doc_id, layout_fp=layout_fp,
                     cnpj_emitente=campos_final.get("emitente_cnpj"),
                     cnpj_destinatario=campos_final.get("destinatario_cnpj"),
-                    receita=receita,
-                    metricas=metricas,
-                    sucesso=sucesso,
+                    receita=receita, metricas=metricas, sucesso=sucesso,
                 )
-
             except Exception:
                 pass
 
             self.db.atualizar_documento_campo(doc_id, "status", status_final)
-            self.db.log(
-                "ingestao_midias",
-                "sistema",
-                f"doc_id={doc_id}|conf={conf:.2f}|status={status_final}|fonte={fonte_final}",
-            )
+            self.db.log("ingestao_midias", "sistema", f"doc_id={doc_id}|conf={conf:.2f}|status={status_final}|fonte={fonte_final}")
 
         except Exception as e_outer:
             log.exception("Falha geral mídia '%s': %s", nome, e_outer)
             status_final = "erro"
             if doc_id > 0:
                 try:
-                    self.db.atualizar_documento_campos(
-                        doc_id, status="erro", motivo_rejeicao=f"Falha geral: {e_outer}"
-                    )
+                    self.db.atualizar_documento_campos(doc_id, status="erro", motivo_rejeicao=f"Falha geral: {e_outer}")
                 except Exception as db_err_f:
                     log.error("Erro CRÍTICO ao marcar erro final doc_id %d: %s", doc_id, db_err_f)
         finally:
@@ -1446,11 +1436,8 @@ class Orchestrator:
             if doc_id > 0:
                 try:
                     self.metrics_agent.registrar_metrica(
-                        db=self.db,
-                        tipo_documento=tipo_doc,
-                        status=status_final,
-                        confianca_media=conf,
-                        tempo_medio=processing_time,
+                        db=self.db, tipo_documento=tipo_doc, status=status_final,
+                        confianca_media=conf, tempo_medio=processing_time,
                     )
                 except Exception as e_m:
                     log.warning("Falha ao registrar métricas finais doc_id=%d: %s", doc_id, e_m)
@@ -1460,7 +1447,6 @@ class Orchestrator:
     # Q&A Analítico (dash/consultas)
     # --------------------------------------------------------
     def _executar_fast_query(self, pergunta: str, catalog: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
-        """Consultas determinísticas simples usando Pandas, sem LLM."""
         log.info("Modo Seguro: FastQuery: '%s'", pergunta)
         pergunta_lower = (pergunta or "").lower()
         df_docs = catalog.get("documentos")
@@ -1486,9 +1472,7 @@ class Orchestrator:
                     df_docs_local["valor_total_num"] = pd.to_numeric(df_docs_local["valor_total"], errors="coerce").fillna(0)
                     top = (
                         df_docs_local.groupby("emitente_nome")["valor_total_num"]
-                        .sum()
-                        .nlargest(n_top)
-                        .reset_index()
+                        .sum().nlargest(n_top).reset_index()
                         .rename(columns={"valor_total_num": "Valor Total"})
                     )
                     texto_resposta = f"Top {n_top} Emitentes por Valor Total:"
@@ -1499,19 +1483,9 @@ class Orchestrator:
             log.error("Erro no FastQuery: %s", e)
             texto_resposta = f"Erro no FastQuery: {e}"
 
-        return {
-            "texto": texto_resposta,
-            "tabela": tabela_resposta,
-            "figuras": [],
-            "duracao_s": 0.01,
-            "code": f"# FastQuery\n# Pergunta: {pergunta}",
-            "agent_name": "FastQueryAgent (Seguro)",
-        }
+        return {"texto": texto_resposta, "tabela": tabela_resposta, "figuras": [], "duracao_s": 0.01, "code": f"# FastQuery\n# Pergunta: {pergunta}", "agent_name": "FastQueryAgent (Seguro)"}
 
-    def responder_pergunta(
-        self, pergunta: str, scope_filters: Optional[Dict[str, Any]] = None, safe_mode: bool = False
-    ) -> Dict[str, Any]:
-        """Delega ao AgenteAnalitico (LLM) ou ao FastQuery determinístico."""
+    def responder_pergunta(self, pergunta: str, scope_filters: Optional[Dict[str, Any]] = None, safe_mode: bool = False) -> Dict[str, Any]:
         if not self.analitico and not safe_mode:
             log.error("Agente Analítico não inicializado.")
             return {"texto": "Erro: Agente analítico não configurado.", "tabela": None, "figuras": []}
@@ -1539,27 +1513,17 @@ class Orchestrator:
                     item_ids_sql = ", ".join(map(str, item_ids))
                     catalog["impostos"] = self.db.query_table("impostos", where=f"item_id IN ({item_ids_sql})")
                 else:
-                    catalog["impostos"] = pd.DataFrame(
-                        columns=["id","item_id","tipo_imposto","cst","origem","base_calculo","aliquota","valor"]
-                    )
+                    catalog["impostos"] = pd.DataFrame(columns=["id","item_id","tipo_imposto","cst","origem","base_calculo","aliquota","valor"])
             else:
-                catalog["itens"] = pd.DataFrame(
-                    columns=["id","documento_id","descricao","ncm","cest","cfop","quantidade","unidade","valor_unitario","valor_total","codigo_produto"]
-                )
-                catalog["impostos"] = pd.DataFrame(
-                    columns=["id","item_id","tipo_imposto","cst","origem","base_calculo","aliquota","valor"]
-                )
+                catalog["itens"] = pd.DataFrame(columns=["id","documento_id","descricao","ncm","cest","cfop","quantidade","unidade","valor_unitario","valor_total","codigo_produto"])
+                catalog["impostos"] = pd.DataFrame(columns=["id","item_id","tipo_imposto","cst","origem","base_calculo","aliquota","valor"])
         except Exception as e:
             log.exception("Falha ao montar catálogo com filtros: %s", e)
             return {"texto": f"Erro ao carregar dados com filtros: {e}", "tabela": None, "figuras": []}
 
         if catalog["documentos"].empty:
             log.info("Nenhum documento válido para análise (considerando filtros).")
-            return {
-                "texto": "Não há documentos válidos (status 'processado' ou 'revisado') que correspondam aos filtros.",
-                "tabela": None,
-                "figuras": [],
-            }
+            return {"texto": "Não há documentos válidos (status 'processado' ou 'revisado') que correspondam aos filtros.", "tabela": None, "figuras": []}
 
         if safe_mode:
             return self._executar_fast_query(pergunta, catalog)
@@ -1575,7 +1539,6 @@ class Orchestrator:
     # Revalidação & Reprocessamento
     # --------------------------------------------------------
     def revalidar_documento(self, documento_id: int) -> Dict[str, Any]:
-        """Aciona a revalidação de um documento específico."""
         try:
             doc = self.db.get_documento(documento_id)
             if not doc:
@@ -1586,18 +1549,13 @@ class Orchestrator:
 
             doc_depois = self.db.get_documento(documento_id)
             novo_status = doc_depois.get("status") if doc_depois else "desconhecido"
-            self.db.log(
-                "revalidacao",
-                "usuario_sistema",
-                f"doc_id={documento_id}|status_anterior={status_anterior}|status_novo={novo_status}|timestamp={self.db.now()}",
-            )
+            self.db.log("revalidacao", "usuario_sistema", f"doc_id={documento_id}|status_anterior={status_anterior}|status_novo={novo_status}|timestamp={self.db.now()}")
             return {"ok": True, "mensagem": f"Documento revalidado. Novo status: {novo_status}."}
         except Exception as e:
             log.exception("Falha ao revalidar doc_id %d: %s", documento_id, e)
             return {"ok": False, "mensagem": f"Falha ao revalidar: {e}"}
 
     def reprocessar_documento(self, documento_id: int) -> Dict[str, Any]:
-        """Deleta um documento e seus dados associados e tenta re-ingerir o arquivo original."""
         log.info("Reprocessamento para doc_id %d...", documento_id)
         try:
             doc_original = self.db.get_documento(documento_id)
@@ -1616,32 +1574,24 @@ class Orchestrator:
             origem_original = doc_original.get("origem", "reprocessamento")
             conteudo_original = caminho_arquivo.read_bytes()
 
-            # Deleta o documento antigo
             self.db.conn.execute("DELETE FROM documentos WHERE id = ?", (documento_id,))
             self.db.conn.commit()
 
-            # Remove o arquivo físico
             try:
                 if caminho_arquivo.exists():
                     caminho_arquivo.unlink()
             except Exception as e_clean:
                 log.warning("Não foi possível excluir arquivo físico '%s': %s", caminho_arquivo, e_clean)
 
-            # Re-ingere
             novo_doc_id = self.ingestir_arquivo(nome=nome_arquivo_original, conteudo=conteudo_original, origem=origem_original)
 
             if novo_doc_id == documento_id:
-                msg = "Reprocessamento falhou: ID antigo igual ao novo."
-                return {"ok": False, "mensagem": msg}
+                return {"ok": False, "mensagem": "Reprocessamento falhou: ID antigo igual ao novo."}
 
             novo_doc_info = self.db.get_documento(novo_doc_id)
             novo_status = novo_doc_info.get("status") if novo_doc_info else "desconhecido"
 
-            self.db.log(
-                "reprocessamento",
-                "usuario_sistema",
-                f"doc_id_antigo={documento_id}|doc_id_novo={novo_doc_id}|status={novo_status}",
-            )
+            self.db.log("reprocessamento", "usuario_sistema", f"doc_id_antigo={documento_id}|doc_id_novo={novo_doc_id}|status={novo_status}")
             return {"ok": True, "mensagem": f"Reprocessamento concluído. Novo ID: {novo_doc_id} (Status: {novo_status}).", "novo_id": novo_doc_id}
         except Exception as e:
             log.exception("Falha ao reprocessar doc_id %d: %s", documento_id, e)
@@ -1651,7 +1601,6 @@ class Orchestrator:
     # Auto-roteamento
     # --------------------------------------------------------
     def processar_automatico(self, nome: str, conteudo: bytes, origem: str = "upload") -> int:
-        """Roteia automaticamente: XML -> XMLParser; caso contrário, OCR/NLP (grafo se disponível)."""
         try:
             doc_hash = self.db.hash_bytes(conteudo)
             existing_id = self.db.find_documento_by_hash(doc_hash)
@@ -1661,13 +1610,8 @@ class Orchestrator:
 
             head = conteudo[:2000]
             if (
-                head.strip().startswith(b"<?xml")
-                or b"<NFe" in head
-                or b"<CTe" in head
-                or b"<MDFe" in head
-                or b"<CFe" in head
-                or b"NFSe" in head
-                or b"Nfse" in head
+                head.strip().startswith(b"<?xml") or b"<NFe" in head or b"<CTe" in head
+                or b"<MDFe" in head or b"<CFe" in head or b"NFSe" in head or b"Nfse" in head
             ):
                 log.info("Detectado XML fiscal: %s", nome)
                 return self.xml_agent.processar(nome, conteudo, origem)
@@ -1677,11 +1621,7 @@ class Orchestrator:
         except Exception as e:
             log.exception("Falha no roteamento automático '%s': %s", nome, e)
             return self.db.inserir_documento(
-                nome_arquivo=nome,
-                tipo="desconhecido",
-                origem=origem,
-                hash=self.db.hash_bytes(conteudo),
-                status="erro",
-                data_upload=self.db.now(),
-                motivo_rejeicao=str(e),
+                nome_arquivo=nome, tipo="desconhecido", origem=origem,
+                hash=self.db.hash_bytes(conteudo), status="erro",
+                data_upload=self.db.now(), motivo_rejeicao=str(e),
             )

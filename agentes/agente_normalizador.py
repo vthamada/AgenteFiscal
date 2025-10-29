@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 import re
-import json
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .utils import (
