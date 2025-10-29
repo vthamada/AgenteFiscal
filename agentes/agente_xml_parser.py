@@ -1,13 +1,14 @@
 # agentes/agente_xml_parser.py
+
 from __future__ import annotations
 
 import logging
 import re
 import time
 import json
+import unicodedata
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
-from pathlib import Path
 
 from .utils import (
     _parse_date_like, _only_digits, _norm_ws
@@ -49,6 +50,7 @@ class AgenteXMLParser:
         motivo_rejeicao = "Falha desconhecida no processamento XML"
         confianca_media = 1.0  # XML estruturado => alta confiança
         caminho_salvo: Optional[str] = None
+        field_completeness: float = 0.0
 
         # 1) Parse seguro com tolerância
         try:
@@ -69,6 +71,25 @@ class AgenteXMLParser:
         # 3) Extrai campos principais + extras
         try:
             campos, extras = self._extrair_campos_por_tipo(root, tipo)
+
+            # 3.1) Completeness de campos canônicos (para métricas/decisão)
+            canons = [
+                "emitente_cnpj","emitente_nome","emitente_uf","emitente_municipio",
+                "destinatario_cnpj","destinatario_nome","destinatario_uf","destinatario_municipio",
+                "valor_total","data_emissao","numero_nota","serie","modelo",
+                "total_produtos","total_servicos","total_icms","total_pis","total_cofins","total_ipi"
+            ]
+            filled = sum(1 for k in canons if self._is_filled(campos.get(k)))
+            field_completeness = round(filled / max(len(canons), 1), 3)
+            extras = extras or {}
+            extras.setdefault("__diagnostics__", {})
+            extras["__diagnostics__"]["field_completeness"] = field_completeness
+
+            # 3.2) Tokens normalizados para o associador (barateia similaridade OCR↔XML)
+            extras["emitente_nome_tokens"] = self._norm_tokens(campos.get("emitente_nome"))
+            extras["destinatario_nome_tokens"] = self._norm_tokens(campos.get("destinatario_nome"))
+            extras["emitente_endereco_tokens"] = self._norm_tokens(campos.get("emitente_endereco"))
+            extras["destinatario_endereco_tokens"] = self._norm_tokens(campos.get("destinatario_endereco"))
 
             # 4) Salvar arquivo físico (mantemos como caminho_xml e caminho_arquivo)
             caminho_salvo = str(self.db.save_upload(nome, conteudo))
@@ -111,12 +132,6 @@ class AgenteXMLParser:
                 destinatario_uf=campos.get("destinatario_uf"),
                 destinatario_municipio=campos.get("destinatario_municipio"),
                 destinatario_endereco=campos.get("destinatario_endereco"),
-
-                # Metadados rápidos p/ filtro (documento)
-                inscricao_estadual=campos.get("inscricao_estadual"),
-                uf=campos.get("uf"),
-                municipio=campos.get("municipio"),
-                endereco=campos.get("endereco"),
 
                 # Totais principais
                 valor_total=campos.get("valor_total"),
@@ -162,8 +177,14 @@ class AgenteXMLParser:
                 caminho_arquivo=caminho_salvo,
                 caminho_xml=caminho_salvo,
 
-                # Meta genérica (inclui extras não mapeados em colunas fixas)
-                meta_json=json.dumps({"detalhes": extras}, ensure_ascii=False) if extras else None,
+                # Meta genérica (inclui extras não mapeados em colunas fixas + __meta__)
+                meta_json=json.dumps({
+                    "detalhes": extras,
+                    "__meta__": {
+                        "tipo": tipo,
+                        "field_completeness": field_completeness
+                    }
+                }, ensure_ascii=False),
             )
 
             # 6) Itens & Impostos
@@ -200,6 +221,7 @@ class AgenteXMLParser:
                     )
                     self.db.log("ingestao_xml", usuario="sistema", detalhes=f"doc_id={doc_id}|tipo={tipo}|status={status}")
                 finally:
+                    # Métricas agregadas (retrocompatível)
                     self.metrics_agent.registrar_metrica(
                         db=self.db,
                         tipo_documento=tipo,
@@ -207,6 +229,20 @@ class AgenteXMLParser:
                         confianca_media=confianca_media,
                         tempo_medio=processing_time,
                     )
+                    # NOVO: desempenho por agente p/ aprendizado do pipeline
+                    try:
+                        self.metrics_agent.registrar_desempenho_agente(
+                            db=self.db,
+                            doc_id=doc_id,
+                            agente="XMLParser",
+                            tipo_documento=tipo,
+                            coverage=field_completeness,
+                            confidence=1.0,
+                            latency_s=processing_time,
+                            extras={"has_itens": True, "schema": campos.get("versao_schema")}
+                        )
+                    except Exception as e_m:
+                        log.debug(f"registrar_desempenho_agente falhou (ignorado): {e_m}")
 
         return doc_id
 
@@ -228,10 +264,21 @@ class AgenteXMLParser:
         tipo = self._detectar_tipo(root)
         campos, extras = self._extrair_campos_por_tipo(root, tipo)
 
-        principais = ["emitente_cnpj", "valor_total", "data_emissao", "chave_acesso"]
-        cov = sum(1 for k in principais if campos.get(k)) / max(len(principais), 1)
+        # Cobertura expandida (mais fiel ao pipeline)
+        principais = [
+            "emitente_cnpj","emitente_nome","emitente_uf","emitente_municipio",
+            "destinatario_cnpj","destinatario_nome","destinatario_uf","destinatario_municipio",
+            "valor_total","data_emissao","numero_nota","serie","modelo",
+            "total_produtos","total_servicos","total_icms","total_pis","total_cofins","total_ipi",
+            "chave_acesso"
+        ]
+        cov = sum(1 for k in principais if self._is_filled(campos.get(k))) / max(len(principais), 1)
 
-        campos["__meta__"] = {"source": "xml", "coverage": round(float(cov), 3), "tipo": tipo}
+        campos["__meta__"] = {
+            "source": "xml",
+            "coverage": round(float(cov), 3),
+            "tipo": tipo
+        }
         campos["extras"] = extras or {}
         return campos
 
@@ -272,21 +319,10 @@ class AgenteXMLParser:
             _parse_date_like(self._get_text(root, ".//{*}Competencia")),
         )
 
-        # Normaliza nomes (espaços)
-        for k in ("emitente_nome", "destinatario_nome", "municipio", "natureza_operacao"):
+        # Normaliza nomes (espaços)
+        for k in ("emitente_nome", "destinatario_nome", "natureza_operacao"):
             if campos.get(k):
                 campos[k] = _norm_ws(campos[k])
-
-        # Endereço consolidado (documento)
-        if not campos.get("endereco"):
-            end_emit = self._find(root, ".//{*}emit/{*}enderEmit")
-            endereco = self._build_address(end_emit) if end_emit is not None else None
-            if not endereco:
-                end_nfse = self._find(root, ".//{*}PrestadorServico/{*}Endereco") or self._find(
-                    root, ".//{*}Prestador/{*}Endereco"
-                )
-                endereco = self._build_address_nfse(end_nfse) if end_nfse is not None else None
-            campos["endereco"] = endereco
 
         # Total consolidado (fallback)
         if campos.get("valor_total") is None:
@@ -391,12 +427,6 @@ class AgenteXMLParser:
             "destinatario_municipio": self._text(end_dest, "xMun"),
             "destinatario_endereco": self._build_address(end_dest),
 
-            # Metadados rápidos (documento)
-            "inscricao_estadual": self._text(emit, "IE"),
-            "uf": self._text(end_emit, "UF"),
-            "municipio": self._text(end_emit, "xMun"),
-            "endereco": self._build_address(end_emit),
-
             # Datas / Totais
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
             "valor_total": self._parse_number(self._text(tot, "vNF"), decimals=2),
@@ -434,7 +464,6 @@ class AgenteXMLParser:
         }
 
         extras: Dict[str, Any] = {}
-        # Exemplo de extras úteis: CFOP global (às vezes em ide/finNFe/usos) e tags pouco usadas
         cfop_first = self._text(self._find(root, ".//{*}det/{*}prod"), "CFOP")
         if cfop_first:
             extras["det/0/CFOP"] = cfop_first
@@ -445,8 +474,37 @@ class AgenteXMLParser:
         emit = self._find(root, ".//{*}emit")
         rem = self._find(root, ".//{*}rem")
         dest = self._find(root, ".//{*}dest") or rem
-        vprest = self._find(root, ".//{*}vPrest")
         ide = self._find(root, ".//{*}ide")
+        vprest = self._find(root, ".//{*}vPrest")
+
+        end_emit = self._find(emit, ".//{*}enderEmit")
+        end_dest = self._find(dest, ".//{*}enderDest")
+        end_rem = self._find(rem, ".//{*}enderReme")
+
+        # Totais / carga
+        v_total = self._parse_number(self._text(vprest, "vTPrest"), decimals=2)
+        v_carga = self._parse_number(self._first_text_by_local_name(root, "vCarga"), decimals=2)
+
+        # Quantidade de volumes (infQ cUnid="03" => UN)
+        qtd_vol = None
+        for infq in self._findall(root, ".//{*}infQ"):
+            cUnid = None
+            qCarga = None
+            for child in infq:
+                lname = child.tag.split("}", 1)[-1]
+                if lname == "cUnid" and child.text:
+                    cUnid = child.text.strip()
+                if lname == "qCarga" and child.text:
+                    qCarga = child.text.strip()
+            if cUnid == "03" and qCarga:
+                qtd_vol = self._parse_number(qCarga, decimals=0)
+                break
+
+        # Placa / UF (rodoviário)
+        rodo = self._find(root, ".//{*}rodo")
+        veic = self._find(rodo, ".//{*}veic")
+        placa = self._text(veic, "placa") if veic is not None else None
+        uf_placa = self._text(veic, "UF") if veic is not None else None
 
         campos = {
             "numero_nota": self._text(ide, "nCT"),
@@ -456,20 +514,22 @@ class AgenteXMLParser:
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
             "emitente_ie": self._text(emit, "IE"),
-            "emitente_uf": self._text(emit, "UF"),
-            "emitente_municipio": self._text(emit, "xMun"),
+            "emitente_uf": self._text(end_emit, "UF"),
+            "emitente_municipio": self._text(end_emit, "xMun"),
 
             "destinatario_nome": self._text(dest, "xNome"),
             "destinatario_cnpj": self._text(dest, "CNPJ"),
             "destinatario_ie": self._text(dest, "IE"),
-            "destinatario_uf": self._text(dest, "UF"),
-            "destinatario_municipio": self._text(dest, "xMun"),
+            "destinatario_uf": self._text(end_dest, "UF") or self._text(end_rem, "UF"),
+            "destinatario_municipio": self._text(end_dest, "xMun") or self._text(end_rem, "xMun"),
 
-            "municipio": self._text(emit, "xMun") or self._text(dest, "xMun"),
-            "uf": self._text(emit, "UF") or self._text(dest, "UF"),
+            # Endereços completos
+            "emitente_endereco": self._build_address(end_emit),
+            "destinatario_endereco": self._build_address(end_dest) or self._build_address(end_rem),
 
+            # Datas / Totais
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
-            "valor_total": self._parse_number(self._text(vprest, "vTPrest"), decimals=2),
+            "valor_total": v_total,
 
             "total_produtos": None,
             "total_servicos": None,
@@ -484,25 +544,37 @@ class AgenteXMLParser:
             "total_pis": None,
             "total_cofins": None,
 
+            # Transporte (CT-e)
             "modalidade_frete": None,
-            "placa_veiculo": None,
-            "uf_veiculo": None,
+            "placa_veiculo": placa,
+            "uf_veiculo": uf_placa,
             "peso_bruto": None,
             "peso_liquido": None,
-            "qtd_volumes": None,
+            "qtd_volumes": qtd_vol,
 
+            # Pagamento
             "forma_pagamento": None,
             "valor_pagamento": None,
             "troco": None,
 
             "chave_acesso": (_only_digits(self._get_attr(root, ".//{*}infCTe", "Id")) or None),
         }
-        return campos, {}
+
+        extras = {}
+        if v_carga is not None:
+            extras["cte/infCarga/vCarga"] = v_carga
+        return campos, extras
 
     def _extrair_campos_mdfe(self, root: ET.Element) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         emit = self._find(root, ".//{*}emit")
         ide = self._find(root, ".//{*}ide")
         tot = self._find(root, ".//{*}tot")
+        end_emit = self._find(emit, ".//{*}enderEmit")
+
+        # Placa / UF (rodoviário tração)
+        veic_tr = self._find(root, ".//{*}infModal/{*}rodo/{*}veicTracao")
+        placa = self._text(veic_tr, "placa") if veic_tr is not None else None
+        uf_placa = self._text(veic_tr, "UF") if veic_tr is not None else None
 
         campos = {
             "numero_nota": self._text(ide, "nMDF"),
@@ -512,11 +584,16 @@ class AgenteXMLParser:
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
             "emitente_ie": self._text(emit, "IE"),
-            "emitente_uf": self._text(emit, "UF"),
-            "emitente_municipio": self._text(emit, "xMun"),
+            "emitente_uf": self._text(end_emit, "UF"),
+            "emitente_municipio": self._text(end_emit, "xMun"),
+            "emitente_endereco": self._build_address(end_emit),
 
-            "municipio": self._text(emit, "xMun"),
-            "uf": self._text(emit, "UF"),
+            "destinatario_nome": None,
+            "destinatario_cnpj": None,
+            "destinatario_ie": None,
+            "destinatario_uf": None,
+            "destinatario_municipio": None,
+            "destinatario_endereco": None,
 
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi")) or self._text(ide, "dIniViagem")),
             "valor_total": self._parse_number(self._text(tot, "vCarga"), decimals=2),
@@ -534,9 +611,10 @@ class AgenteXMLParser:
             "total_pis": None,
             "total_cofins": None,
 
+            # Transporte (MDF-e)
             "modalidade_frete": None,
-            "placa_veiculo": None,
-            "uf_veiculo": None,
+            "placa_veiculo": placa,
+            "uf_veiculo": uf_placa,
             "peso_bruto": None,
             "peso_liquido": None,
             "qtd_volumes": None,
@@ -545,13 +623,40 @@ class AgenteXMLParser:
             "valor_pagamento": None,
             "troco": None,
         }
-        return campos, {}
+        extras = {}
+        qcte = self._first_text_by_local_name(root, "qCTe")
+        if qcte:
+            extras["mdfe/tot/qCTe"] = qcte
+        return campos, extras
 
     def _extrair_campos_cfe(self, root: ET.Element) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         emit = self._find(root, ".//emit") or self._find(root, ".//{*}emit")
         dest = self._find(root, ".//dest") or self._find(root, ".//{*}dest")
         total = self._find(root, ".//total") or self._find(root, ".//{*}total")
         ide = self._find(root, ".//ide") or self._find(root, ".//{*}ide")
+        pgto = self._find(root, ".//pgto") or self._find(root, ".//{*}pgto")
+
+        end_emit = self._find(emit, ".//{*}enderEmit") or self._find(emit, ".//enderEmit")
+        end_dest = self._find(dest, ".//{*}enderDest") or self._find(dest, ".//enderDest")
+
+        # Pagamento (SAT): MP/cMP, MP/vMP e vTroco
+        forma_pag = None
+        valor_pag = None
+        if pgto is not None:
+            vtotal = 0.0
+            first_forma = None
+            for mp in self._findall(pgto, ".//{*}MP"):
+                cod = self._text(mp, "cMP")
+                val = self._parse_number(self._text(mp, "vMP"), decimals=2)
+                if first_forma is None and cod:
+                    first_forma = cod
+                if val is not None:
+                    vtotal += val
+            if first_forma:
+                forma_pag = first_forma
+            if vtotal > 0:
+                valor_pag = round(vtotal, 2)
+        troco = self._parse_number(self._first_text_by_local_name(pgto, "vTroco"), decimals=2) if pgto is not None else None
 
         campos = {
             "numero_nota": self._text(ide, "nCFe") or self._text(ide, "nNF"),
@@ -561,17 +666,16 @@ class AgenteXMLParser:
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
             "emitente_ie": self._text(emit, "IE"),
-            "emitente_uf": self._text(emit, "UF"),
-            "emitente_municipio": self._text(emit, "xMun"),
+            "emitente_uf": self._text(end_emit, "UF"),
+            "emitente_municipio": self._text(end_emit, "xMun"),
+            "emitente_endereco": self._build_address(end_emit),
 
             "destinatario_nome": self._text(dest, "xNome"),
             "destinatario_cnpj": self._text(dest, "CNPJ"),
             "destinatario_ie": self._text(dest, "IE"),
-            "destinatario_uf": self._text(dest, "UF"),
-            "destinatario_municipio": self._text(dest, "xMun"),
-
-            "municipio": self._text(emit, "xMun"),
-            "uf": self._text(emit, "UF"),
+            "destinatario_uf": self._text(end_dest, "UF"),
+            "destinatario_municipio": self._text(end_dest, "xMun"),
+            "destinatario_endereco": self._build_address(end_dest),
 
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
             "valor_total": self._parse_number(
@@ -598,9 +702,9 @@ class AgenteXMLParser:
             "peso_liquido": None,
             "qtd_volumes": None,
 
-            "forma_pagamento": None,
-            "valor_pagamento": None,
-            "troco": None,
+            "forma_pagamento": forma_pag,
+            "valor_pagamento": valor_pag,
+            "troco": troco,
         }
         return campos, {}
 
@@ -616,8 +720,27 @@ class AgenteXMLParser:
         dest_cnpj = self._get_text(toma, ".//{*}Cnpj") or self._get_text(toma, ".//{*}CNPJ")
         dest_cpf = self._get_text(toma, ".//{*}Cpf") or self._get_text(toma, ".//{*}CPF")
 
-        end_nfse = self._find(prest, ".//{*}Endereco")
-        endereco = self._build_address_nfse(end_nfse) if end_nfse is not None else None
+        end_prest = self._find(prest, ".//{*}Endereco")
+        end_toma = self._find(toma, ".//{*}Endereco")
+        emit_endereco = self._build_address_nfse(end_prest) if end_prest is not None else None
+        dest_endereco = self._build_address_nfse(end_toma) if end_toma is not None else None
+
+        # UF/Mun: tenta por endereço; se não houver, usa códigos de município
+        emit_uf = self._get_text(end_prest, ".//{*}Estado") or self._get_text(end_prest, ".//{*}UF")
+        dest_uf = self._get_text(end_toma, ".//{*}Estado") or self._get_text(end_toma, ".//{*}UF")
+        emit_mun = self._get_text(end_prest, ".//{*}Municipio") or self._get_text(end_prest, ".//{*}xMun")
+        dest_mun = self._get_text(end_toma, ".//{*}Municipio") or self._get_text(end_toma, ".//{*}xMun")
+
+        if not emit_uf:
+            cod_mun_prest = self._get_text(prest, ".//{*}CodigoMunicipioPrestador") or self._get_text(root, ".//{*}CodigoMunicipio")
+            uf_from_code = self._uf_from_cod_municipio(cod_mun_prest)
+            if uf_from_code:
+                emit_uf = uf_from_code
+        if not dest_uf:
+            cod_mun_toma = self._get_text(toma, ".//{*}CodigoMunicipioTomador") or self._get_text(toma, ".//{*}CodigoMunicipio")
+            uf_from_code = self._uf_from_cod_municipio(cod_mun_toma)
+            if uf_from_code:
+                dest_uf = uf_from_code
 
         valor_total = self._coalesce(
             self._parse_number(self._get_text(root, ".//{*}ValorServicos"), decimals=2),
@@ -635,22 +758,26 @@ class AgenteXMLParser:
         )
 
         campos = {
+            # Emitente/Destinatário + endereços próprios
             "emitente_nome": emit_nome,
             "emitente_cnpj": emit_cnpj,
             "emitente_cpf": emit_cpf,
+            "emitente_endereco": emit_endereco,
+
             "destinatario_nome": dest_nome,
             "destinatario_cnpj": dest_cnpj,
             "destinatario_cpf": dest_cpf,
+            "destinatario_endereco": dest_endereco,
 
-            "municipio": self._get_text_local(end_nfse, "xMun") or self._get_text_local(end_nfse, "Municipio"),
-            "uf": self._get_text_local(end_nfse, "UF") or self._get_text_local(end_nfse, "Estado"),
-            "endereco": endereco,
+            "emitente_uf": emit_uf,
+            "emitente_municipio": emit_mun,
+            "destinatario_uf": dest_uf,
+            "destinatario_municipio": dest_mun,
 
             "data_emissao": data_emissao,
             "valor_total": valor_total,
             "total_servicos": valor_total,
 
-            # restantes ficam None (não padronizados)
             "total_produtos": None,
             "valor_descontos": None,
             "valor_frete": None,
@@ -681,13 +808,18 @@ class AgenteXMLParser:
         if cod_serv:
             extras["servico/Codigo"] = cod_serv
 
-        aliq_iss = self._get_text(root, ".//{*}Aliquota") or self._get_text(root, ".//{*}pISS")
+        aliq_iss = (
+            self._get_text(root, ".//{*}Aliquota")
+            or self._get_text(root, ".//{*}pISS")
+            or self._get_text(root, ".//{*}Servico/{*}Valores/{*}Aliquota")
+        )
         if aliq_iss:
             extras["iss/Aliquota"] = aliq_iss
 
         return campos, extras
 
     def _extrair_campos_generico(self, root: ET.Element) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        # Fallback extremamente conservador: nunca preenche UF/Mun/End genéricos
         emit = self._find(root, ".//{*}emit") or self._find(root, ".//emit")
         end_emit = self._find(root, ".//{*}enderEmit") or self._find(root, ".//enderEmit")
         ide = self._find(root, ".//{*}ide") or self._find(root, ".//ide")
@@ -706,10 +838,7 @@ class AgenteXMLParser:
             "emitente_municipio": self._text(end_emit, "xMun"),
             "emitente_endereco": self._build_address(end_emit),
 
-            "municipio": self._text(end_emit, "xMun"),
-            "uf": self._text(end_emit, "UF"),
-            "endereco": self._build_address(end_emit),
-
+            # Nenhum campo genérico de UF/Mun/End no documento
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
             "valor_total": self._parse_number(
                 self._text(total, "vNF") or self._text(total, "vCFe") or self._text(total, "vTPrest"), decimals=2
@@ -888,17 +1017,14 @@ class AgenteXMLParser:
         """
         meta: Dict[str, Any] = {}
 
-        # versão do schema no próprio nó raiz (muito comum)
         versao = root.attrib.get("versao") if hasattr(root, "attrib") else None
         if versao:
             meta["versao_schema"] = versao
 
-        # Ambiente: ide/tpAmb (1=produção, 2=homologação)
         tpAmb = self._first_text_by_local_name(root, "tpAmb")
         if tpAmb:
             meta["ambiente"] = tpAmb
 
-        # Protocolo: procurar em protNFe/protCTe/etc.
         nProt = self._first_text_by_local_name(root, "nProt")
         if nProt:
             meta["protocolo_autorizacao"] = nProt
@@ -915,7 +1041,6 @@ class AgenteXMLParser:
         if xMotivo:
             meta["xmotivo"] = xMotivo
 
-        # Responsável técnico (quando preenchido no XML)
         respTec = self._find(root, ".//{*}respTec")
         if respTec is not None:
             meta["responsavel_tecnico"] = (
@@ -930,7 +1055,6 @@ class AgenteXMLParser:
         Retorna (forma_pagamento, valor_pagamento, troco)
         Busca em <pag><detPag> (layout 4.00+) e em variantes anteriores.
         """
-        # forma_pag: tPag / indPag
         det = self._find(root, ".//{*}pag/{*}detPag")
         if det is not None:
             forma = self._text(det, "tPag") or self._text(det, "indPag")
@@ -938,7 +1062,6 @@ class AgenteXMLParser:
             troco = self._parse_number(self._first_text_by_local_name(root, "vTroco"), decimals=2)
             return forma, valor, troco
 
-        # fallback em <pag> direto
         pag = self._find(root, ".//{*}pag")
         if pag is not None:
             forma = self._text(pag, "tPag") or self._text(pag, "indPag")
@@ -1148,6 +1271,7 @@ class AgenteXMLParser:
         status = "quarentena"
         doc_id = -1
         try:
+            caminho = str(self.db.save_upload(nome, conteudo))
             doc_id = self.db.inserir_documento(
                 nome_arquivo=nome,
                 tipo=tipo,
@@ -1156,8 +1280,8 @@ class AgenteXMLParser:
                 status=status,
                 data_upload=self.db.now(),
                 motivo_rejeicao=motivo,
-                caminho_arquivo=str(self.db.save_upload(nome, conteudo)),
-                caminho_xml=str(self.db.save_upload(nome + ".xml", conteudo)),
+                caminho_arquivo=caminho,
+                caminho_xml=caminho,  # reutiliza o mesmo caminho; evita duplicidade
             )
         finally:
             processing_time = time.time() - t_start
@@ -1178,7 +1302,57 @@ class AgenteXMLParser:
                     confianca_media=0.0,
                     tempo_medio=processing_time,
                 )
+                try:
+                    self.metrics_agent.registrar_desempenho_agente(
+                        db=self.db,
+                        doc_id=doc_id,
+                        agente="XMLParser",
+                        tipo_documento=tipo,
+                        coverage=0.0,
+                        confidence=0.0,
+                        latency_s=processing_time,
+                        extras={"erro": "xml_invalido", "motivo": motivo},
+                    )
+                except Exception:
+                    pass
         return doc_id
 
+    # -------------------- Enriquecedores auxiliares --------------------
+    def _is_filled(self, v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str):
+            return bool(v.strip())
+        return True
+
+    def _norm_tokens(self, s: Optional[str]) -> Optional[str]:
+        """Normaliza para tokens simples: lower, sem acentos, sem pontuação múltipla."""
+        if not s:
+            return None
+        t = s.lower().strip()
+        t = "".join(ch for ch in unicodedata.normalize("NFD", t) if unicodedata.category(ch) != "Mn")
+        t = re.sub(r"[^a-z0-9\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t or None
+
+    def _uf_from_cod_municipio(self, codigo: Optional[str]) -> Optional[str]:
+        """
+        Mapeia os 2 primeiros dígitos do código de município IBGE para UF.
+        Aceita strings com/sem zeros à esquerda. Retorna sigla UF ou None.
+        """
+        if not codigo:
+            return None
+        cod = re.sub(r"\D+", "", codigo)
+        if len(cod) < 2:
+            return None
+        d2 = cod[:2]
+        mapa = {
+            "11":"RO","12":"AC","13":"AM","14":"RR","15":"PA","16":"AP","17":"TO",
+            "21":"MA","22":"PI","23":"CE","24":"RN","25":"PB","26":"PE","27":"AL","28":"SE","29":"BA",
+            "31":"MG","32":"ES","33":"RJ","35":"SP",
+            "41":"PR","42":"SC","43":"RS",
+            "50":"MS","51":"MT","52":"GO","53":"DF",
+        }
+        return mapa.get(d2)
 
 __all__ = ["AgenteXMLParser"]
