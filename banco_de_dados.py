@@ -112,6 +112,18 @@ class BancoDeDados:
             destinatario_municipio  TEXT,
             destinatario_endereco   TEXT,
 
+            -- Endereços detalhados (novos campos)
+            emitente_logradouro     TEXT,
+            emitente_numero         TEXT,
+            emitente_complemento    TEXT,
+            emitente_bairro         TEXT,
+            emitente_cep            TEXT,
+            destinatario_logradouro TEXT,
+            destinatario_numero     TEXT,
+            destinatario_complemento TEXT,
+            destinatario_bairro     TEXT,
+            destinatario_cep        TEXT,
+
             -- Identificação fiscal adicional
             numero_nota             TEXT,
             serie                   TEXT,
@@ -294,6 +306,17 @@ class BancoDeDados:
         )
         """)
 
+        # CONFIGURAÇÕES (chave/valor) para preferências do usuário e integrações
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS config (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chave    TEXT NOT NULL,
+            valor    TEXT,
+            usuario  TEXT,
+            UNIQUE(chave, usuario)
+        )
+        """)
+
         # CATÁLOGO NCM
         cur.execute("""
         CREATE TABLE IF NOT EXISTS ncm_catalogo (
@@ -314,8 +337,24 @@ class BancoDeDados:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_impostos_item ON impostos(item_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_docdet_doc ON documentos_detalhes(documento_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_docdet_chave ON documentos_detalhes(chave)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_config_chave_usuario ON config(chave, usuario)")
 
         self.conn.commit()
+
+        # Garante colunas novas via ALTER TABLE quando base já existe
+        try:
+            self._ensure_column("documentos", "emitente_logradouro TEXT")
+            self._ensure_column("documentos", "emitente_numero TEXT")
+            self._ensure_column("documentos", "emitente_complemento TEXT")
+            self._ensure_column("documentos", "emitente_bairro TEXT")
+            self._ensure_column("documentos", "emitente_cep TEXT")
+            self._ensure_column("documentos", "destinatario_logradouro TEXT")
+            self._ensure_column("documentos", "destinatario_numero TEXT")
+            self._ensure_column("documentos", "destinatario_complemento TEXT")
+            self._ensure_column("documentos", "destinatario_bairro TEXT")
+            self._ensure_column("documentos", "destinatario_cep TEXT")
+        except Exception:
+            pass
 
     # ------------------------- Helpers internos -------------------------
     def _colunas_tabela(self, tabela: str) -> set[str]:
@@ -347,6 +386,19 @@ class BancoDeDados:
             if diff:
                 log.debug(f"Campos ignorados para '{tabela}': {diff}")
         return filtrados
+
+    def _ensure_column(self, table: str, column_def: str) -> None:
+        """Adiciona coluna se não existir (uso interno em migrações leves)."""
+        try:
+            col_name = column_def.split()[0].strip()
+            cur = self.conn.cursor()
+            cur.execute(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in cur.fetchall()}
+            if col_name not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+                self.conn.commit()
+        except Exception:
+            pass
 
     # ------------------------- Operações de escrita -------------------------
     def inserir_documento(self, **campos) -> int:
@@ -578,7 +630,7 @@ class BancoDeDados:
         """
         allowed_tables = {
             "documentos", "itens", "impostos", "extracoes",
-            "logs", "memoria", "revisoes", "usuarios", "metricas", "documentos_detalhes"
+            "logs", "memoria", "revisoes", "usuarios", "metricas", "documentos_detalhes", "config"
         }
         if table not in allowed_tables:
             raise ValueError(f"Tabela não suportada: {table}")
@@ -590,6 +642,48 @@ class BancoDeDados:
         if limit is not None and isinstance(limit, int) and limit > 0:
             sql += f" LIMIT {limit}"
         return pd.read_sql_query(sql, self.conn)
+
+    # ------------------------- Config (key/value) -------------------------
+    def set_config(self, chave: str, valor: Any, usuario: Optional[str] = None) -> None:
+        """Upsert em config; valor é convertido para JSON quando possível."""
+        if not chave:
+            return
+        if isinstance(valor, (dict, list)):
+            try:
+                valor = json.dumps(valor, ensure_ascii=False)
+            except Exception:
+                valor = str(valor)
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            UPDATE config SET valor = ? WHERE chave = ? AND IFNULL(usuario,'') = IFNULL(?, '')
+            """,
+            (valor, chave, usuario),
+        )
+        if cur.rowcount == 0:
+            cur.execute(
+                """
+                INSERT INTO config (chave, valor, usuario) VALUES (?, ?, ?)
+                """,
+                (chave, valor, usuario),
+            )
+        self.conn.commit()
+
+    def get_config(self, chave: str, usuario: Optional[str] = None, default: Any = None) -> Any:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT valor FROM config WHERE chave = ? AND IFNULL(usuario,'') = IFNULL(?, '')",
+            (chave, usuario),
+        )
+        row = cur.fetchone()
+        if not row:
+            return default
+        val = row[0]
+        # tenta desserializar JSON
+        try:
+            return json.loads(val)
+        except Exception:
+            return val
 
     # ------------------------- Fechamento -------------------------
     def close(self) -> None:

@@ -403,6 +403,22 @@ class AgenteXMLParser:
         # Transporte
         modal_frete, placa, uf_placa, peso_b, peso_l, q_vol = self._extrair_transporte(root)
 
+        # Componentes de endereço (emitente/destinatário)
+        emit_logr = self._text(end_emit, "xLgr")
+        emit_num  = self._text(end_emit, "nro")
+        emit_cpl  = self._text(end_emit, "xCpl")
+        emit_bai  = self._text(end_emit, "xBairro")
+        emit_mun  = self._text(end_emit, "xMun")
+        emit_uf   = self._text(end_emit, "UF")
+        emit_cep  = self._text(end_emit, "CEP")
+        dest_logr = self._text(end_dest, "xLgr")
+        dest_num  = self._text(end_dest, "nro")
+        dest_cpl  = self._text(end_dest, "xCpl")
+        dest_bai  = self._text(end_dest, "xBairro")
+        dest_mun  = self._text(end_dest, "xMun")
+        dest_uf   = self._text(end_dest, "UF")
+        dest_cep  = self._text(end_dest, "CEP")
+
         campos = {
             # Identificação
             "numero_nota": self._text(ide, "nNF"),
@@ -416,9 +432,14 @@ class AgenteXMLParser:
             "emitente_cpf": self._text(emit, "CPF"),
             "emitente_ie": self._text(emit, "IE"),
             "emitente_im": self._text(emit, "IM"),
-            "emitente_uf": self._text(end_emit, "UF"),
-            "emitente_municipio": self._text(end_emit, "xMun"),
+            "emitente_uf": emit_uf,
+            "emitente_municipio": emit_mun,
             "emitente_endereco": self._build_address(end_emit),
+            "emitente_logradouro": emit_logr,
+            "emitente_numero": emit_num,
+            "emitente_complemento": emit_cpl,
+            "emitente_bairro": emit_bai,
+            "emitente_cep": emit_cep,
 
             # Destinatário (completos)
             "destinatario_nome": self._text(dest, "xNome"),
@@ -426,9 +447,14 @@ class AgenteXMLParser:
             "destinatario_cpf": self._text(dest, "CPF"),
             "destinatario_ie": self._text(dest, "IE"),
             "destinatario_im": self._text(dest, "IM"),
-            "destinatario_uf": self._text(end_dest, "UF"),
-            "destinatario_municipio": self._text(end_dest, "xMun"),
+            "destinatario_uf": dest_uf,
+            "destinatario_municipio": dest_mun,
             "destinatario_endereco": self._build_address(end_dest),
+            "destinatario_logradouro": dest_logr,
+            "destinatario_numero": dest_num,
+            "destinatario_complemento": dest_cpl,
+            "destinatario_bairro": dest_bai,
+            "destinatario_cep": dest_cep,
 
             # Datas / Totais
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
@@ -509,6 +535,22 @@ class AgenteXMLParser:
         placa = self._text(veic, "placa") if veic is not None else None
         uf_placa = self._text(veic, "UF") if veic is not None else None
 
+        # Componentes de endereço onde disponíveis
+        emit_logr = self._text(end_emit, "xLgr")
+        emit_num  = self._text(end_emit, "nro")
+        emit_cpl  = self._text(end_emit, "xCpl")
+        emit_bai  = self._text(end_emit, "xBairro")
+        emit_mun  = self._text(end_emit, "xMun")
+        emit_uf   = self._text(end_emit, "UF")
+        dest_logr = self._text(end_dest, "xLgr") or self._text(end_rem, "xLgr")
+        dest_num  = self._text(end_dest, "nro") or self._text(end_rem, "nro")
+        dest_cpl  = self._text(end_dest, "xCpl") or self._text(end_rem, "xCpl")
+        dest_bai  = self._text(end_dest, "xBairro") or self._text(end_rem, "xBairro")
+        dest_mun  = self._text(end_dest, "xMun") or self._text(end_rem, "xMun")
+        dest_uf   = self._text(end_dest, "UF") or self._text(end_rem, "UF")
+        emit_cep  = self._text(end_emit, "CEP")
+        dest_cep  = self._text(end_dest, "CEP") or self._text(end_rem, "CEP")
+
         campos = {
             "numero_nota": self._text(ide, "nCT"),
             "serie": self._text(ide, "serie"),
@@ -517,14 +559,24 @@ class AgenteXMLParser:
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
             "emitente_ie": self._text(emit, "IE"),
-            "emitente_uf": self._text(end_emit, "UF"),
-            "emitente_municipio": self._text(end_emit, "xMun"),
+            "emitente_uf": emit_uf,
+            "emitente_municipio": emit_mun,
+            "emitente_logradouro": emit_logr,
+            "emitente_numero": emit_num,
+            "emitente_complemento": emit_cpl,
+            "emitente_bairro": emit_bai,
+            "emitente_cep": emit_cep,
 
             "destinatario_nome": self._text(dest, "xNome"),
             "destinatario_cnpj": self._text(dest, "CNPJ"),
             "destinatario_ie": self._text(dest, "IE"),
-            "destinatario_uf": self._text(end_dest, "UF") or self._text(end_rem, "UF"),
-            "destinatario_municipio": self._text(end_dest, "xMun") or self._text(end_rem, "xMun"),
+            "destinatario_uf": dest_uf,
+            "destinatario_municipio": dest_mun,
+            "destinatario_logradouro": dest_logr,
+            "destinatario_numero": dest_num,
+            "destinatario_complemento": dest_cpl,
+            "destinatario_bairro": dest_bai,
+            "destinatario_cep": dest_cep,
 
             # Endereços completos
             "emitente_endereco": self._build_address(end_emit),
@@ -579,6 +631,14 @@ class AgenteXMLParser:
         placa = self._text(veic_tr, "placa") if veic_tr is not None else None
         uf_placa = self._text(veic_tr, "UF") if veic_tr is not None else None
 
+        # Componentes do emitente
+        emit_logr = self._text(end_emit, "xLgr")
+        emit_num  = self._text(end_emit, "nro")
+        emit_cpl  = self._text(end_emit, "xCpl")
+        emit_bai  = self._text(end_emit, "xBairro")
+        emit_mun  = self._text(end_emit, "xMun")
+        emit_uf   = self._text(end_emit, "UF")
+
         campos = {
             "numero_nota": self._text(ide, "nMDF"),
             "serie": self._text(ide, "serie"),
@@ -587,9 +647,13 @@ class AgenteXMLParser:
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
             "emitente_ie": self._text(emit, "IE"),
-            "emitente_uf": self._text(end_emit, "UF"),
-            "emitente_municipio": self._text(end_emit, "xMun"),
+            "emitente_uf": emit_uf,
+            "emitente_municipio": emit_mun,
             "emitente_endereco": self._build_address(end_emit),
+            "emitente_logradouro": emit_logr,
+            "emitente_numero": emit_num,
+            "emitente_complemento": emit_cpl,
+            "emitente_bairro": emit_bai,
 
             "destinatario_nome": None,
             "destinatario_cnpj": None,
@@ -661,6 +725,22 @@ class AgenteXMLParser:
                 valor_pag = round(vtotal, 2)
         troco = self._parse_number(self._first_text_by_local_name(pgto, "vTroco"), decimals=2) if pgto is not None else None
 
+        # Componentes
+        emit_logr = self._text(end_emit, "xLgr") or self._get_text_local(end_emit, "Logradouro")
+        emit_num  = self._text(end_emit, "nro") or self._get_text_local(end_emit, "Numero")
+        emit_cpl  = self._text(end_emit, "xCpl") or self._get_text_local(end_emit, "Complemento")
+        emit_bai  = self._text(end_emit, "xBairro") or self._get_text_local(end_emit, "Bairro")
+        emit_mun  = self._text(end_emit, "xMun")
+        emit_uf   = self._text(end_emit, "UF")
+        dest_logr = self._text(end_dest, "xLgr") or self._get_text_local(end_dest, "Logradouro")
+        dest_num  = self._text(end_dest, "nro") or self._get_text_local(end_dest, "Numero")
+        dest_cpl  = self._text(end_dest, "xCpl") or self._get_text_local(end_dest, "Complemento")
+        dest_bai  = self._text(end_dest, "xBairro") or self._get_text_local(end_dest, "Bairro")
+        dest_mun  = self._text(end_dest, "xMun")
+        dest_uf   = self._text(end_dest, "UF")
+        emit_cep  = self._text(end_emit, "CEP") or self._get_text_local(end_emit, "CEP")
+        dest_cep  = self._text(end_dest, "CEP") or self._get_text_local(end_dest, "CEP")
+
         campos = {
             "numero_nota": self._text(ide, "nCFe") or self._text(ide, "nNF"),
             "serie": self._text(ide, "serie"),
@@ -669,16 +749,26 @@ class AgenteXMLParser:
             "emitente_nome": self._text(emit, "xNome"),
             "emitente_cnpj": self._text(emit, "CNPJ"),
             "emitente_ie": self._text(emit, "IE"),
-            "emitente_uf": self._text(end_emit, "UF"),
-            "emitente_municipio": self._text(end_emit, "xMun"),
+            "emitente_uf": emit_uf,
+            "emitente_municipio": emit_mun,
             "emitente_endereco": self._build_address(end_emit),
+            "emitente_logradouro": emit_logr,
+            "emitente_numero": emit_num,
+            "emitente_complemento": emit_cpl,
+            "emitente_bairro": emit_bai,
+            "emitente_cep": emit_cep,
 
             "destinatario_nome": self._text(dest, "xNome"),
             "destinatario_cnpj": self._text(dest, "CNPJ"),
             "destinatario_ie": self._text(dest, "IE"),
-            "destinatario_uf": self._text(end_dest, "UF"),
-            "destinatario_municipio": self._text(end_dest, "xMun"),
+            "destinatario_uf": dest_uf,
+            "destinatario_municipio": dest_mun,
             "destinatario_endereco": self._build_address(end_dest),
+            "destinatario_logradouro": dest_logr,
+            "destinatario_numero": dest_num,
+            "destinatario_complemento": dest_cpl,
+            "destinatario_bairro": dest_bai,
+            "destinatario_cep": dest_cep,
 
             "data_emissao": _parse_date_like(self._text_any(ide, ("dhEmi", "dEmi"))),
             "valor_total": self._parse_number(
@@ -765,6 +855,18 @@ class AgenteXMLParser:
         emit_endereco = self._build_address_nfse(end_emit) if end_emit is not None else None
         dest_endereco = self._build_address_nfse(end_toma) if end_toma is not None else None
 
+        # Componentes de endereço (NFSe tem variações de nomes)
+        emit_logr = (self._get_text_local(end_emit, "Endereco") or self._get_text_local(end_emit, "xLgr") or self._get_text_local(end_emit, "Logradouro"))
+        emit_num  = (self._get_text_local(end_emit, "Numero") or self._get_text_local(end_emit, "nro"))
+        emit_cpl  = (self._get_text_local(end_emit, "Complemento") or self._get_text_local(end_emit, "xCpl"))
+        emit_bai  = (self._get_text_local(end_emit, "Bairro") or self._get_text_local(end_emit, "xBairro"))
+        emit_cep  = (self._get_text_local(end_emit, "CEP") or self._get_text_local(end_emit, "Cep"))
+        dest_logr = (self._get_text_local(end_toma, "Endereco") or self._get_text_local(end_toma, "xLgr") or self._get_text_local(end_toma, "Logradouro"))
+        dest_num  = (self._get_text_local(end_toma, "Numero") or self._get_text_local(end_toma, "nro"))
+        dest_cpl  = (self._get_text_local(end_toma, "Complemento") or self._get_text_local(end_toma, "xCpl"))
+        dest_bai  = (self._get_text_local(end_toma, "Bairro") or self._get_text_local(end_toma, "xBairro"))
+        dest_cep  = (self._get_text_local(end_toma, "CEP") or self._get_text_local(end_toma, "Cep"))
+
         # UF/Mun a partir do endereço ou dos códigos de município
         emit_uf = self._get_text(end_emit, ".//{*}UF") or self._get_text(end_emit, ".//{*}Estado")
         dest_uf = self._get_text(end_toma, ".//{*}UF") or self._get_text(end_toma, ".//{*}Estado")
@@ -815,6 +917,16 @@ class AgenteXMLParser:
             "destinatario_cnpj": dest_cnpj,
             "destinatario_cpf": dest_cpf,
             "destinatario_endereco": dest_endereco,
+            "emitente_logradouro": emit_logr,
+            "emitente_numero": emit_num,
+            "emitente_complemento": emit_cpl,
+            "emitente_bairro": emit_bai,
+            "emitente_cep": emit_cep,
+            "destinatario_logradouro": dest_logr,
+            "destinatario_numero": dest_num,
+            "destinatario_complemento": dest_cpl,
+            "destinatario_bairro": dest_bai,
+            "destinatario_cep": dest_cep,
 
             "emitente_uf": emit_uf,
             "emitente_municipio": emit_mun,
