@@ -16,7 +16,7 @@ if not log.handlers:
 
 # --------------- Constantes/regex e helpers ---------------
 _WHITESPACE_RE = re.compile(r"\s+", re.S)
-_MONEY_CHARS_RE = re.compile(r"[^\d,\-]")
+_MONEY_CHARS_RE = re.compile(r"[^\d\.,\-]")
 _UF_SET = {
     "AC","AL","AP","AM","BA","CE","DF","ES","GO",
     "MA","MT","MS","MG","PA","PB","PR","PE","PI",
@@ -33,13 +33,29 @@ def _to_float_br(s: Optional[str]) -> Optional[float]:
     if not s:
         return None
     s2 = str(s).strip()
+    # Remove tudo exceto dígitos, pontos, vírgulas e sinal de negativo
     s2 = _MONEY_CHARS_RE.sub("", s2)
-    if s2.count(",") == 1 and (s2.count(".") == 0 or s2.rfind(",") > s2.rfind(".")):
-        s2 = s2.replace(".", "").replace(",", ".")
-    s2 = s2.replace(",", "")
+    # Normalização heurística:
+    # - Se houver tanto '.' quanto ',' e o '.' aparece antes da ',' -> interpretamos '.' como separador de milhares e ',' como decimal (formato BR)
+    # - Se houver tanto '.' quanto ',' e a ',' aparece antes do '.' -> interpretamos ',' como separador de milhares e '.' como decimal (menos comum)
+    # - Se houver apenas ',' -> é decimal (BR) -> substituir por '.'
+    # - Se houver apenas '.' -> é decimal (EN) -> manter
     try:
+        if "," in s2 and "." in s2:
+            if s2.rfind(".") < s2.rfind(","):
+                # ex: 1.234,56 -> 1234.56
+                s2 = s2.replace(".", "").replace(",", ".")
+            else:
+                # ex: 1,234.56 -> 1234.56
+                s2 = s2.replace(",", "")
+        elif "," in s2:
+            # ex: 1234,56 -> 1234.56
+            s2 = s2.replace(".", "").replace(",", ".")
+        else:
+            # somente ponto(s) ou apenas dígitos: remove possíveis espaços já removidos
+            s2 = s2.replace(",", "")
         return float(s2)
-    except ValueError:
+    except Exception:
         return None
 
 def _parse_date_like(s: Optional[str]) -> Optional[str]:

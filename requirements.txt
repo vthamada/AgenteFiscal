@@ -6,10 +6,6 @@ matplotlib
 pyyaml
 cryptography
 pillow
-easyocr
-torch
-torchvision
-pypdfium2
 langchain
 langchain-core
 langchain-openai
@@ -18,4 +14,4 @@ langgraph
 pytest
 pytest-cov
 pytest-html
-dotenv
+python-dotenv

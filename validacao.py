@@ -185,7 +185,7 @@ class ValidadorFiscal:
         "PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"
     }
 
-    # Mínimo obrigatório para “documento válido”
+    # Mínimo obrigatório padrão (usado como base; pode variar por tipo)
     CAMPOS_OBRIGATORIOS: Tuple[str, ...] = (
         "emitente_cnpj", "valor_total", "data_emissao", "chave_acesso"
     )
@@ -202,7 +202,7 @@ class ValidadorFiscal:
 
     def __init__(self,
                  regras_path: Path = REGRAS_FISCAIS_PATH,
-                 llm: Optional["BaseChatModel"] = None,
+                 llm: Optional[Any] = None,
                  *,
                  require_general_location: bool = False  # ← compat: não exige uf/municipio/endereco legados
                  ):
@@ -232,7 +232,7 @@ class ValidadorFiscal:
         *,
         doc_id: int | None = None,
         doc: Dict[str, Any] | None = None,
-        db: "BancoDeDados",
+    db: Any,
         force_revalidation: bool = False,
         usar_llm: bool = True,
         agente_llm: Any | None = None,
@@ -553,7 +553,7 @@ class ValidadorFiscal:
         bonus = 0.05 if total >= 12 and base > 0.7 else 0.0
         return max(0.0, min(1.0, base + bonus))
 
-    def _persistir_status(self, *, db: "BancoDeDados", doc_id: int, status_atual: str,
+    def _persistir_status(self, *, db: Any, doc_id: int, status_atual: str,
                           status_final: str, erros: List[str]) -> None:
         if status_final in ("invalido", "parcial"):
             novo_status = "revisao_pendente"
@@ -585,8 +585,37 @@ class ValidadorFiscal:
         return not self._listar_obrigatorios_faltando(doc)
 
     def _listar_obrigatorios_faltando(self, doc: Dict[str, Any]) -> List[str]:
-        faltando = []
-        for k in self.CAMPOS_OBRIGATORIOS:
+        """Define obrigatórios por tipo de documento.
+        - NFe/NFCe/CTe/MDF-e/CF-e: exige chave_acesso (44) e emitente_cnpj/emitente_cpf
+        - NFSe: NÃO exige chave_acesso; exige (emitente_cnpj OU emitente_cpf), data_emissao, valor_total
+        Outras variações caem no conjunto padrão conservador.
+        """
+        tipo = str(doc.get("tipo") or "").strip().lower()
+        cnpj_emit = (doc.get("emitente_cnpj") or "").strip()
+        cpf_emit = (doc.get("emitente_cpf") or "").strip()
+
+        base: List[str] = ["data_emissao"]
+        # Valor: aceitar alias total_servicos quando valor_total vier vazio (ex.: NFSe)
+        valor_total = doc.get("valor_total")
+        if valor_total in (None, "", [], {}) and doc.get("total_servicos") not in (None, "", [], {}):
+            # Trata como presente
+            pass
+        else:
+            base.append("valor_total")
+
+        if tipo in {"nfse", "nfs-e", "nfs-e", "nf s-e"}:
+            # Em NFSe não há chave de acesso 44 dígitos; há 'Código de Verificação' e afins
+            # Exigir que ao menos um identificador do emitente exista (CNPJ ou CPF)
+            if not (cnpj_emit or cpf_emit):
+                base.append("emitente_cnpj")  # mantemos mensagem compatível
+        else:
+            # Demais documentos: exigir chave 44 e CNPJ/CPF do emitente
+            base.extend(["chave_acesso"])
+            if not (cnpj_emit or cpf_emit):
+                base.append("emitente_cnpj")
+
+        faltando: List[str] = []
+        for k in base:
             v = doc.get(k)
             if v in (None, "", [], {}):
                 faltando.append(k)

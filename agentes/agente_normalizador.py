@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import re
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple
 
 from .utils import (
     _parse_date_like, _to_float_br, _only_digits, _norm_ws,
@@ -31,14 +31,13 @@ except Exception:
     invoke_with_context = None       # type: ignore
     validation_explanations = None   # type: ignore
 
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel as _T
+# Nota: Evitamos imports de tipos opcionais em tempo de análise para reduzir alertas do linter.
 
 
 class AgenteNormalizadorCampos:
     """
     Agente de Contextualização Fiscal:
-    - Normaliza e consolida campos vindos de OCR/NLP/LLM/XML antes de persistir.
+    - Normaliza e consolida campos vindos de XML (e outras fontes estruturadas) antes de persistir.
     - Adiciona raciocínio contextual para adaptar regras conforme o TIPO de documento.
     - Gera explicações das normalizações e um score de sanidade (0–1).
     - Sugere reprocessamento quando detectar inconsistências relevantes.
@@ -126,7 +125,7 @@ class AgenteNormalizadorCampos:
 
     def __init__(
         self,
-        llm: Optional["BaseChatModel"] = None,
+        llm: Optional[Any] = None,
         *,
         enable_llm: bool = False,
         drop_general_fields: bool = True,
@@ -154,28 +153,32 @@ class AgenteNormalizadorCampos:
         - Valida CFOP/NCM/CEST (cabeçalho) e faz heurística de inversão emitente↔destinatário.
         - Adiciona __meta__['normalizador'] com:
             {
-              "tipo_documento": "NFE|NFCE|NFSE|CTE|DESCONHECIDO",
+              "tipo_documento": "NFE|NFCE|NFSE|CTE|CFE|DESCONHECIDO",
               "sanity_score": 0..1,
               "explicacoes": [ ... ],
               "sugerir_reprocessamento": bool
             }
         """
-        use_drop = self.drop_general_fields if drop_general_fields is None else bool(drop_general_fields)
-        use_ctx  = bool(keep_context_copy or self.keep_context_copy)
+        # Flags com fallback seguro
+        use_drop = bool(drop_general_fields if drop_general_fields is not None else getattr(self, "drop_general_fields", False))
+        use_ctx  = bool(keep_context_copy or getattr(self, "keep_context_copy", False))
 
         src = dict(campos or {})
         out = dict(src)
         explicacoes: List[str] = []
 
-        # Snapshot de campos genéricos (se for remover depois)
+        # 0) Snapshot de campos genéricos (se for remover depois)
         context_snapshot: Dict[str, Any] = {}
         if use_ctx:
             for k in ("uf", "municipio", "endereco", "inscricao_estadual"):
                 if k in out:
                     context_snapshot[k] = out.get(k)
 
-        # 1) Consolidar aliases numéricos
-        self._consolidar_aliases_numericos(out)
+        # 1) Consolidar aliases numéricos (fail-safe)
+        try:
+            self._consolidar_aliases_numericos(out)
+        except Exception:
+            pass
 
         # 2) Datas
         for k in ("data_emissao", "data_saida", "data_recebimento", "competencia", "data_autorizacao"):
@@ -216,7 +219,7 @@ class AgenteNormalizadorCampos:
             v = re.sub(r"[^0-9A-Z./\-]", "", v)
             v = v.replace("BAIRRO", "").replace("POSTO", "").replace("RUA", "")
             v = _norm_ws(v)
-            return v if self.RE_IE_OK.match(v) else None
+            return v if self.RE_IE_OK.match(v or "") else None
 
         for k in ("emitente_ie", "destinatario_ie", "inscricao_estadual"):
             before = out.get(k)
@@ -233,15 +236,30 @@ class AgenteNormalizadorCampos:
                 if before != out[k]:
                     explicacoes.append(f"Sanitizo '{k}' (antes='{before}', depois='{out[k]}').")
 
-        # 6) Identificação
+        # 6) Identificação (número/serie/modelo)
         out["numero_nota"] = self._norm_numero_nota(out.get("numero_nota"))
         out["serie"]       = self._norm_serie(out.get("serie"))
         out["modelo"]      = self._norm_modelo(out.get("modelo"))
 
         # 7) UF/Município
-        self._normalize_uf_municipio(out)
+        try:
+            self._normalize_uf_municipio(out)
+        except Exception:
+            # Fallback mínimo (nunca quebra)
+            uf_keys = ["emitente_uf", "destinatario_uf", "uf"]
+            for k in uf_keys:
+                if out.get(k):
+                    s = str(out[k]).strip().upper()
+                    s = re.sub(r"[^A-Z]", "", s)
+                    out[k] = s[:2] if len(s) >= 2 else None
+            for k in ("emitente_municipio", "destinatario_municipio", "municipio"):
+                if out.get(k):
+                    s = str(out.get(k)).strip()
+                    s = re.sub(r"\s*-\s*[A-Z]{2}\b.*$", "", s)
+                    s = re.sub(r"\bCEP[:\s]*\d{5}-?\d{3}.*$", "", s, flags=re.I)
+                    out[k] = s.strip() or None
 
-        # 8) Nomes com preservação de siglas (com LLM opcional de refinamento leve)
+        # 8) Nomes (title case com siglas preservadas)
         for k in ("emitente_nome", "destinatario_nome"):
             if out.get(k):
                 before = out.get(k)
@@ -249,20 +267,32 @@ class AgenteNormalizadorCampos:
                 if before and out[k] != before:
                     explicacoes.append(f"Padronizo '{k}' para Title Case com siglas preservadas.")
 
+        # 8.1) Refino opcional via LLM (curto e seguro)
         if self.enable_llm and self.llm and normalize_text_fields:
-            refined = self._llm_refine_text_fields(out, fields=("emitente_nome", "destinatario_nome", "endereco", "municipio"))
-            if refined is not out:
-                out = refined  # já vem normalizado no próprio dicionário
+            try:
+                refined = self._llm_refine_text_fields(
+                    out, fields=("emitente_nome", "destinatario_nome", "endereco", "municipio")
+                )
+                if refined is not out:
+                    out = refined
+            except Exception:
+                pass
 
-        # 9) Chave de acesso
+        # 9) Chave de acesso (44 dígitos)
         if out.get("chave_acesso"):
             before = out.get("chave_acesso")
-            out["chave_acesso"] = self._find_chave_44(str(out.get("chave_acesso")))
+            ca = self._find_chave_44(str(out.get("chave_acesso")))
+            out["chave_acesso"] = ca or None
             if before and out["chave_acesso"] != before:
                 explicacoes.append("Ajusto 'chave_acesso' para sequência válida de 44 dígitos.")
 
         # 10) Pagamento
-        self._normalize_pagamento(out)
+        try:
+            self._normalize_pagamento(out)
+        except Exception:
+            # Fallback: não quebra se a função for custom e lançar erro
+            if out.get("forma_pagamento"):
+                out["forma_pagamento"] = _norm_ws(str(out.get("forma_pagamento")).upper())
 
         # 11) CFOP/NCM/CEST (cabeçalho)
         for head_key, pattern in (("cfop", self.RE_CFOP), ("ncm", self.RE_NCM), ("cest", self.RE_CEST)):
@@ -274,12 +304,19 @@ class AgenteNormalizadorCampos:
                     explicacoes.append(f"Sanitizo '{head_key}' (antes='{before}', depois='{out[head_key]}').")
 
         # 12) Heurística de inversão emitente↔destinatário
-        swap_done = self._fix_possible_swap_emit_dest(out)
+        swap_done = False
+        try:
+            swap_done = self._fix_possible_swap_emit_dest(out)
+        except Exception:
+            swap_done = False
         if swap_done:
             explicacoes.append("Detecto inversão Emitente↔Destinatário e corrijo de forma segura.")
 
-        # 13) Detecção do tipo de documento (heurística + LLM desempate via invoke_with_context)
-        tipo_doc = self._infer_document_type(out)
+        # 13) Inferência do tipo de documento (heurística + LLM desempate)
+        try:
+            tipo_doc = self._infer_document_type(out)
+        except Exception:
+            tipo_doc = "DESCONHECIDO"
 
         if tipo_doc == "DESCONHECIDO" and self.enable_llm and self.llm and invoke_with_context:
             texto_ref = " ".join(
@@ -309,22 +346,69 @@ class AgenteNormalizadorCampos:
                 pass
 
         # 14) Score de sanidade + verificações semânticas
-        sanity_score, inconsistencias, dicas = self._avaliar_coerencia_semantica(out, tipo_doc)
+        def _avaliar_coerencia_semantica_local(d: Dict[str, Any]) -> Tuple[float, List[str], List[str]]:
+            inconsist: List[str] = []
+            dicas: List[str] = []
+            crit_ok = 0
+            total_crit = 3  # emitente_cnpj, valor_total, data_emissao
 
-        # Explicações: primeiro as determinísticas…
+            if _only_digits(str(d.get("emitente_cnpj") or "")).isdigit() and len(_only_digits(str(d.get("emitente_cnpj") or ""))) >= 14:
+                crit_ok += 1
+            else:
+                inconsist.append("CNPJ do emitente ausente/inválido.")
+
+            if isinstance(d.get("valor_total"), (int, float)) and (d.get("valor_total") or 0) > 0:
+                crit_ok += 1
+            else:
+                inconsist.append("Valor total ausente/inválido.")
+
+            if d.get("data_emissao"):
+                crit_ok += 1
+            else:
+                inconsist.append("Data de emissão ausente/inválida.")
+
+            # Consistência básica com itens (quando existir)
+            try:
+                if "itens" in d and isinstance(d["itens"], list) and d.get("valor_total"):
+                    soma = 0.0
+                    ok = False
+                    for it in d["itens"]:
+                        v = it.get("valor_total")
+                        if isinstance(v, (int, float)):
+                            soma += float(v); ok = True
+                    if ok:
+                        # aceita divergência de até 25% ou R$ 1,00
+                        if abs(float(d["valor_total"]) - soma) > max(1.0, 0.25 * float(d["valor_total"])):
+                            inconsist.append("Soma dos itens distante do valor total (tolerância 25% ou R$ 1,00).")
+            except Exception:
+                pass
+
+            sanity = max(0.0, min(1.0, crit_ok / float(total_crit)))
+            if sanity < 0.65:
+                dicas.append("Reprocessar com fonte mais rica ou revisar manualmente; campos críticos estão ausentes.")
+            return sanity, inconsist, dicas
+
+        try:
+            sanity_score, inconsistencias, dicas = self._avaliar_coerencia_semantica(out, tipo_doc)
+        except Exception:
+            sanity_score, inconsistencias, dicas = _avaliar_coerencia_semantica_local(out)
+
+        # Explicações determinísticas
         explicacoes.extend(inconsistencias)
-        sugerir_reproc = sanity_score < 0.65 or any("inconsistente" in s.lower() for s in inconsistencias)
+        sugerir_reproc = sanity_score < 0.65 or any(
+            any(tok in s.lower() for tok in ("distante", "ausente", "inválido", "invalido"))
+            for s in inconsistencias
+        )
         if sugerir_reproc and dicas:
             explicacoes.extend(dicas)
 
-        # …depois, se LLM disponível, geramos versões curtas/claras das inconsistências
+        # …e versões curtas/claras via LLM (opcional)
         if self.enable_llm and self.llm and validation_explanations and (inconsistencias or dicas):
             try:
                 issues_payload = {"inconsistencias": inconsistencias, "dicas": dicas, "tipo_documento": tipo_doc}
                 ve = validation_explanations(self.llm, issues_payload=issues_payload, temperature=0.0)  # type: ignore[misc]
                 msgs = ve.get("json")
                 if isinstance(msgs, list) and msgs:
-                    # acrescenta sem duplicar
                     for m in msgs:
                         sm = str(m).strip()
                         if sm and sm not in explicacoes:
@@ -344,9 +428,9 @@ class AgenteNormalizadorCampos:
             for k in ("uf", "municipio", "endereco", "inscricao_estadual"):
                 out.pop(k, None)
 
-        # 16) __meta__.normalizador
+        # 16) __meta__.normalizador (sem quebrar meta já existente)
         meta_norm = {
-            "tipo_documento": tipo_doc,
+            "tipo_documento": str(tipo_doc or "DESCONHECIDO").upper(),
             "sanity_score": round(float(sanity_score), 3),
             "explicacoes": explicacoes,
             "sugerir_reprocessamento": bool(sugerir_reproc)
@@ -355,8 +439,11 @@ class AgenteNormalizadorCampos:
         meta["normalizador"] = meta_norm
         out["__meta__"] = meta
 
-        # 17) Preencher espelhos legados (sem sobrescrever)
-        self._preencher_espelhos_legados(out)
+        # 17) Espelhos legados
+        try:
+            self._preencher_espelhos_legados(out)
+        except Exception:
+            pass
 
         return out
 
@@ -448,21 +535,19 @@ class AgenteNormalizadorCampos:
         s = _only_digits(str(v))
         if not s:
             return None
-        s = s.lstrip("0") or "0"  # remove zeros à esquerda
+        s = s.lstrip("0") or "0"
         return s if self.RE_NUMERO.match(s) else None
 
     def _norm_serie(self, v: Any) -> Optional[str]:
         if v is None:
             return None
-        s = str(v).strip().upper()
-        s = s.replace(" ", "")
+        s = str(v).strip().upper().replace(" ", "")
         return s if self.RE_SERIE.match(s) else None
 
     def _norm_modelo(self, v: Any) -> Optional[str]:
         if v is None:
             return None
-        s = str(v).strip().upper()
-        s = s.replace(" ", "")
+        s = str(v).strip().upper().replace(" ", "")
         return s if self.RE_MODELO.match(s) else None
 
     # ---------------------------------------------------------------------
@@ -681,7 +766,7 @@ class AgenteNormalizadorCampos:
                 inconsistencias.append(
                     f"Soma de componentes ({round(comp,2)}) inconsistente com valor_total ({round(vt,2)})."
                 )
-                dicas.append("Revise itens/impostos/frete/descontos; pode haver coluna não reconhecida no OCR.")
+                dicas.append("Revise itens/impostos/frete/descontos; verifique colunas ou origem dos dados.")
 
         # 2) CFOP x UF (regra simples)
         cfop = (d.get("cfop") or "").strip()

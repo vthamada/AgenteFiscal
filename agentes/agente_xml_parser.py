@@ -205,6 +205,9 @@ class AgenteXMLParser:
             motivo_rejeicao = f"Erro no processamento: {e_proc}"
             if doc_id > 0:
                 self.db.atualizar_documento_campos(doc_id, status=status, motivo_rejeicao=motivo_rejeicao)
+            else:
+                # Registra o XML como inválido/quarentena para não perder o arquivo e manter rastreabilidade
+                return self._registrar_xml_invalido(nome, conteudo, origem, motivo_rejeicao, t_start)
 
         finally:
             # 8) Registro de extração + métricas
@@ -709,40 +712,84 @@ class AgenteXMLParser:
         return campos, {}
 
     def _extrair_campos_nfse(self, root: ET.Element) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        prest = self._find(root, ".//{*}PrestadorServico") or self._find(root, ".//{*}Prestador")
-        toma = self._find(root, ".//{*}TomadorServico") or self._find(root, ".//{*}Tomador")
+        """Extrai NFSe cobrindo múltiplas variantes (Prestador/PrestadorServico, emit; Tomador/toma)."""
+        # Nós possíveis
+        prest = (
+            self._find(root, ".//{*}PrestadorServico") or
+            self._find(root, ".//{*}Prestador") or
+            self._find(root, ".//{*}prest")
+        )
+        toma = (
+            self._find(root, ".//{*}TomadorServico") or
+            self._find(root, ".//{*}Tomador") or
+            self._find(root, ".//{*}toma")
+        )
+        emit_node = self._find(root, ".//{*}emit") or prest
 
-        emit_nome = self._get_text(prest, ".//{*}RazaoSocial") or self._get_text(prest, ".//{*}NomeFantasia") or self._get_text(prest, ".//{*}xNome")
-        dest_nome = self._get_text(toma, ".//{*}RazaoSocial") or self._get_text(toma, ".//{*}xNome") or self._get_text(toma, ".//{*}Nome")
+        # Identificação
+        emit_nome = (
+            self._get_text(emit_node, ".//{*}xNome")
+            or self._get_text(prest, ".//{*}RazaoSocial")
+            or self._get_text(prest, ".//{*}NomeFantasia")
+            or self._get_text(prest, ".//{*}xNome")
+        )
+        dest_nome = (
+            self._get_text(toma, ".//{*}RazaoSocial")
+            or self._get_text(toma, ".//{*}xNome")
+            or self._get_text(toma, ".//{*}Nome")
+        )
 
-        emit_cnpj = self._get_text(prest, ".//{*}Cnpj") or self._get_text(prest, ".//{*}CNPJ")
-        emit_cpf = self._get_text(prest, ".//{*}Cpf") or self._get_text(prest, ".//{*}CPF")
+        emit_cnpj = (
+            self._get_text(emit_node, ".//{*}CNPJ")
+            or self._get_text(prest, ".//{*}Cnpj")
+            or self._get_text(prest, ".//{*}CNPJ")
+        )
+        emit_cpf = (
+            self._get_text(emit_node, ".//{*}CPF")
+            or self._get_text(prest, ".//{*}Cpf")
+            or self._get_text(prest, ".//{*}CPF")
+        )
         dest_cnpj = self._get_text(toma, ".//{*}Cnpj") or self._get_text(toma, ".//{*}CNPJ")
         dest_cpf = self._get_text(toma, ".//{*}Cpf") or self._get_text(toma, ".//{*}CPF")
 
-        end_prest = self._find(prest, ".//{*}Endereco")
-        end_toma = self._find(toma, ".//{*}Endereco")
-        emit_endereco = self._build_address_nfse(end_prest) if end_prest is not None else None
+        # Endereços
+        end_emit = (
+            self._find(emit_node, ".//{*}enderNac")
+            or self._find(emit_node, ".//{*}Endereco")
+        )
+        end_toma = (
+            self._find(toma, ".//{*}end")
+            or self._find(toma, ".//{*}Endereco")
+            or self._find(toma, ".//{*}endNac")
+        )
+        emit_endereco = self._build_address_nfse(end_emit) if end_emit is not None else None
         dest_endereco = self._build_address_nfse(end_toma) if end_toma is not None else None
 
-        # UF/Mun: tenta por endereço; se não houver, usa códigos de município
-        emit_uf = self._get_text(end_prest, ".//{*}Estado") or self._get_text(end_prest, ".//{*}UF")
-        dest_uf = self._get_text(end_toma, ".//{*}Estado") or self._get_text(end_toma, ".//{*}UF")
-        emit_mun = self._get_text(end_prest, ".//{*}Municipio") or self._get_text(end_prest, ".//{*}xMun")
-        dest_mun = self._get_text(end_toma, ".//{*}Municipio") or self._get_text(end_toma, ".//{*}xMun")
+        # UF/Mun a partir do endereço ou dos códigos de município
+        emit_uf = self._get_text(end_emit, ".//{*}UF") or self._get_text(end_emit, ".//{*}Estado")
+        dest_uf = self._get_text(end_toma, ".//{*}UF") or self._get_text(end_toma, ".//{*}Estado")
+        emit_mun = self._get_text(end_emit, ".//{*}xMun") or self._get_text(end_emit, ".//{*}Municipio")
+        dest_mun = self._get_text(end_toma, ".//{*}xMun") or self._get_text(end_toma, ".//{*}Municipio")
 
         if not emit_uf:
-            cod_mun_prest = self._get_text(prest, ".//{*}CodigoMunicipioPrestador") or self._get_text(root, ".//{*}CodigoMunicipio")
-            uf_from_code = self._uf_from_cod_municipio(cod_mun_prest)
-            if uf_from_code:
-                emit_uf = uf_from_code
+            cod_mun_emit = (
+                self._get_text(end_emit, ".//{*}cMun")
+                or self._get_text(emit_node, ".//{*}cMun")
+                or self._get_text(prest, ".//{*}CodigoMunicipioPrestador")
+                or self._get_text(root, ".//{*}CodigoMunicipio")
+            )
+            emit_uf = self._uf_from_cod_municipio(cod_mun_emit) or emit_uf
         if not dest_uf:
-            cod_mun_toma = self._get_text(toma, ".//{*}CodigoMunicipioTomador") or self._get_text(toma, ".//{*}CodigoMunicipio")
-            uf_from_code = self._uf_from_cod_municipio(cod_mun_toma)
-            if uf_from_code:
-                dest_uf = uf_from_code
+            cod_mun_toma = (
+                self._get_text(end_toma, ".//{*}cMun")
+                or self._get_text(toma, ".//{*}CodigoMunicipioTomador")
+                or self._get_text(toma, ".//{*}CodigoMunicipio")
+            )
+            dest_uf = self._uf_from_cod_municipio(cod_mun_toma) or dest_uf
 
+        # Totais e datas
         valor_total = self._coalesce(
+            self._parse_number(self._get_text(root, ".//{*}vLiq"), decimals=2),
             self._parse_number(self._get_text(root, ".//{*}ValorServicos"), decimals=2),
             self._parse_number(self._get_text(root, ".//{*}vServ"), decimals=2),
             self._parse_number(self._get_text(root, ".//{*}ValorLiquidoNfse"), decimals=2),
@@ -750,9 +797,9 @@ class AgenteXMLParser:
 
         data_emissao = _parse_date_like(
             self._coalesce(
+                self._get_text(root, ".//{*}dhEmi"),
                 self._get_text(root, ".//{*}DataEmissao"),
                 self._get_text(root, ".//{*}dtEmissao"),
-                self._get_text(root, ".//{*}dhEmi"),
                 self._get_text(root, ".//{*}Competencia"),
             )
         )
@@ -804,7 +851,11 @@ class AgenteXMLParser:
 
         extras: Dict[str, Any] = {}
         # Guardar códigos de serviço, alíquota ISS, deduções, CNAE, etc., quando existirem
-        cod_serv = self._get_text(root, ".//{*}ItemListaServico") or self._get_text(root, ".//{*}CodigoServico")
+        cod_serv = (
+            self._get_text(root, ".//{*}ItemListaServico")
+            or self._get_text(root, ".//{*}CodigoServico")
+            or self._get_text(root, ".//{*}cTribNac")
+        )
         if cod_serv:
             extras["servico/Codigo"] = cod_serv
 
@@ -1110,7 +1161,9 @@ class AgenteXMLParser:
                 return val
         return None
 
-    def _first_text_by_local_name(self, node: ET.Element, local_name: str) -> Optional[str]:
+    def _first_text_by_local_name(self, node: Optional[ET.Element], local_name: str) -> Optional[str]:
+        if node is None:
+            return None
         lname = local_name.lower()
         for el in node.iter():
             if el.tag.split("}", 1)[-1].lower() == lname and el.text:
@@ -1150,13 +1203,17 @@ class AgenteXMLParser:
         return _norm_ws(", ".join(parts)) if parts else None
 
     # ---------- XML helpers tolerantes ----------
-    def _iter_local(self, node: ET.Element, local: str) -> Iterable[ET.Element]:
+    def _iter_local(self, node: Optional[ET.Element], local: str) -> Iterable[ET.Element]:
+        if node is None:
+            return
         lname = local.lower()
         for el in node.iter():
             if el.tag.split("}", 1)[-1].lower() == lname:
                 yield el
 
-    def _find(self, node: ET.Element, xpath: str) -> Optional[ET.Element]:
+    def _find(self, node: Optional[ET.Element], xpath: str) -> Optional[ET.Element]:
+        if node is None:
+            return None
         m = re.fullmatch(r"\.//(?:\{\*\})?([A-Za-z0-9_:-]+)", (xpath or "").strip())
         if m:
             target = m.group(1)
@@ -1168,7 +1225,9 @@ class AgenteXMLParser:
         except Exception:
             return None
 
-    def _findall(self, node: ET.Element, xpath: str) -> List[ET.Element]:
+    def _findall(self, node: Optional[ET.Element], xpath: str) -> List[ET.Element]:
+        if node is None:
+            return []
         m = re.fullmatch(r"\.//(?:\{\*\})?([A-Za-z0-9_:-]+)", (xpath or "").strip())
         if m:
             target = m.group(1)
@@ -1179,8 +1238,22 @@ class AgenteXMLParser:
             return []
 
     def _get_text(self, node: Optional[ET.Element], xpath: str) -> Optional[str]:
+        """XPath-safe text getter with local-name wildcard support.
+        Accepts patterns like './/{*}Cnpj' and falls back to ElementTree find()."""
         if node is None:
             return None
+        # Suporte a './/{*}Tag' => busca por local-name ignorando namespace
+        try:
+            m = re.fullmatch(r"\.//(?:\{\*\})?([A-Za-z0-9_:-]+)", (xpath or "").strip())
+            if m:
+                target = m.group(1)
+                for el in self._iter_local(node, target):
+                    if el is not None and el.text:
+                        return el.text.strip()
+                return None
+        except Exception:
+            pass
+        # Fallback: find nativo (pode não suportar '{*}')
         try:
             el = node.find(xpath)
             if el is not None and el.text:
@@ -1198,8 +1271,13 @@ class AgenteXMLParser:
         return None
 
     def _get_attr(self, node: ET.Element, xpath: str, attr: str) -> Optional[str]:
+        """XPath-safe attribute getter with local-name support for the element path."""
         try:
-            el = node.find(xpath)
+            # Use o _find tolerante a namespace
+            el = self._find(node, xpath)
+            if el is None:
+                # Fallback: tentativa direta
+                el = node.find(xpath)
             if el is not None:
                 val = el.get(attr)
                 return val.strip() if isinstance(val, str) else None

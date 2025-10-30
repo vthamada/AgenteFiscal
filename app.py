@@ -23,11 +23,11 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      /* evita “corte” no topo e melhora o respiro geral */
-      .block-container { padding-top: .5rem !important; }
+      /* evita corte no topo e melhora o respiro geral */
+      .block-container { padding-top: 2.0rem !important; }
       .stAlert div[data-baseweb="notification"] { padding: 0.6rem 0.8rem; }
 
-      /* header “grudado” no topo, útil em telas menores */
+      /* header fixo com altura previsível */
       header[data-testid="stHeader"]{
         position: sticky; top: 0; z-index: 100;
         background: #fff; border-bottom: 1px solid #eee;
@@ -54,8 +54,14 @@ st.markdown(
       .soft { color:#6b7280; }
       .badge { font-size:.75rem; padding:.15rem .4rem; border-radius:6px; border:1px solid #E5E7EB; background:#F3F4F6; }
       .timeline li { margin-bottom:.25rem; }
-      .chat-bubble-user { background:#e9f3ff; border:1px solid #cfe4ff; padding:10px 12px; border-radius:12px; }
-      .chat-bubble-assistant { background:#f6f6f6; border:1px solid #e6e6e6; padding:10px 12px; border-radius:12px; }
+            .chat-wrap { display:flex; flex-direction:column; gap:.5rem; }
+            .chat-bubble-user { background:#e9f3ff; border:1px solid #cfe4ff; padding:10px 12px; border-radius:12px; }
+            .chat-bubble-assistant { background:#f6f6f6; border:1px solid #e6e6e6; padding:10px 12px; border-radius:12px; }
+            .chat-meta { color:#6b7280; font-size:.8rem; margin-bottom:.35rem; }
+            .card { border:1px solid #E5E7EB; border-radius:10px; padding:.6rem .8rem; background:#fff; }
+            .card h5 { margin:.1rem 0 .4rem 0; }
+            .btn-row { display:flex; gap:.5rem; align-items:center; }
+            .tight-row { display:flex; gap:.75rem; align-items:flex-end; flex-wrap:wrap; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -122,6 +128,100 @@ def tidy_dataframe(
             if col in df2.columns:
                 df2[col] = df2[col].apply(mask_doc)
     return df2
+
+def reduce_empty_columns(df: pd.DataFrame, min_non_empty_ratio: float = 0.05, keep: Optional[List[str]] = None) -> pd.DataFrame:
+    """Remove colunas quase vazias para uma visualização mais limpa."""
+    if df is None or df.empty:
+        return df
+    keep = keep or []
+    mask_keep = set([c for c in keep if c in df.columns])
+    cols = []
+    n = len(df)
+    for c in df.columns:
+        if c in mask_keep:
+            cols.append(c)
+            continue
+        non_empty = df[c].replace({None: pd.NA, "": pd.NA}).dropna()
+        if n == 0 or (len(non_empty) / max(n, 1)) >= min_non_empty_ratio:
+            cols.append(c)
+    return df[cols]
+
+def compose_address_row(row: pd.Series, prefix: str) -> str:
+    parts = []
+    for k in ("logradouro", "endereco", "numero", "bairro", "municipio", "uf", "cep"):
+        col = f"{prefix}_{k}"
+        if col in row and str(row[col]).strip():
+            parts.append(str(row[col]).strip())
+    return ", ".join(parts)
+
+def with_composed_addresses(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    try:
+        df["emitente_endereco_full"] = df.apply(lambda r: compose_address_row(r, "emitente"), axis=1)
+        df["destinatario_endereco_full"] = df.apply(lambda r: compose_address_row(r, "destinatario"), axis=1)
+    except Exception:
+        pass
+    return df
+
+def join_impostos_itens(db: "BancoDeDados", documento_id: int) -> pd.DataFrame:
+    """Retorna itens da nota com colunas de impostos por item (ICMS/IPI/PIS/COFINS/ISS)."""
+    try:
+        df_itens = db.query_table("itens", where=f"documento_id = {int(documento_id)}")
+    except Exception:
+        return pd.DataFrame()
+    if df_itens is None or df_itens.empty:
+        return tidy_dataframe(df_itens)
+    try:
+        df_imp = db.query_table("impostos", where=f"item_id IN (SELECT id FROM itens WHERE documento_id = {int(documento_id)})")
+    except Exception:
+        df_imp = pd.DataFrame()
+    if df_imp is not None and not df_imp.empty:
+        # pivot de valor e aliquota
+        val_pvt = pd.pivot_table(df_imp, index="item_id", columns="tipo_imposto", values="valor", aggfunc="sum")
+        ali_pvt = pd.pivot_table(df_imp, index="item_id", columns="tipo_imposto", values="aliquota", aggfunc="mean")
+        # renomeia colunas
+        if val_pvt is not None:
+            val_pvt = val_pvt.rename(columns=lambda c: str(c).lower() + "_valor").reset_index()
+        if ali_pvt is not None:
+            ali_pvt = ali_pvt.rename(columns=lambda c: str(c).lower() + "_aliquota").reset_index()
+        # merge
+        df_join = df_itens.merge(val_pvt, how="left", left_on="id", right_on="item_id")
+        df_join = df_join.merge(ali_pvt, how="left", left_on="id", right_on="item_id", suffixes=("", "_ali"))
+        # remove colunas auxiliares
+        drop_cols = [c for c in ("item_id", "item_id_ali") if c in df_join.columns]
+        if drop_cols:
+            df_join = df_join.drop(columns=drop_cols)
+        return df_join
+    return df_itens
+
+def download_button_for_df(df: pd.DataFrame, label: str, file_name: str, help_text: Optional[str] = None):
+    try:
+        data = (df or pd.DataFrame()).to_csv(index=False).encode("utf-8")
+        st.download_button(label, data=data, file_name=file_name, mime="text/csv", help=(help_text or ""))
+    except Exception:
+        pass
+
+def pick(df: pd.DataFrame, cols: List[str], default: str = "—") -> Any:
+    """Pega o primeiro valor não-vazio da primeira linha entre as colunas informadas."""
+    try:
+        if df is None or df.empty:
+            return default
+        for c in cols:
+            if c in df.columns and not df[c].empty:
+                v = df[c].iloc[0]
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s == "" or s.lower() == "none":
+                    continue
+                if isinstance(v, float) and pd.isna(v):
+                    continue
+                return v
+        return default
+    except Exception:
+        return default
 
 def mask_df_id_cols(df: pd.DataFrame) -> pd.DataFrame:
     return tidy_dataframe(df, mask_id_cols=True)
@@ -241,8 +341,14 @@ def attempt_login(db: BancoDeDados, email: str, senha: str) -> bool:
 def ui_header(db: BancoDeDados):
     left, right = st.columns([5, 3])
     with left:
-        st.markdown("### 📄 Agente Fiscal – Orquestração Cognitiva, OCR, XML, Validação & Insights")
+        st.markdown("### 📄 Agente Fiscal – Orquestração Cognitiva, XML, Validação & Insights")
         st.caption("Pipeline fiscal multimodal com agentes inteligentes, blackboard e decisões adaptativas.")
+        try:
+            only_xml = (os.getenv("ONLY_XML", "1").strip().lower() in {"1","true","yes","on"})
+            if only_xml:
+                st.info("Modo Somente XML ativo: envie apenas arquivos .xml fiscais. PDFs/Imagens serão encaminhados para quarentena.")
+        except Exception:
+            pass
     with right:
         st.markdown("#### ⚙️ Ambiente")
         st.write(f"- **LLM**: {st.session_state.llm_status_message}")
@@ -347,13 +453,16 @@ def tab_processar(orch: Orchestrator, db: BancoDeDados):
         )
     with up_col2:
         origem = st.text_input("Origem (rótulo livre)", value="upload_ui")
-        ingest = st.button(
-            f"Ingerir {len(uploaded_files) if uploaded_files else 0} Arquivo(s)",
-            use_container_width=True,
-            type="primary",
-            disabled=not uploaded_files,
-        )
-        limpar = st.button("Limpar fila", use_container_width=True)
+        c_btn1, c_btn2 = st.columns(2)
+        with c_btn1:
+            ingest = st.button(
+                f"Ingerir {len(uploaded_files) if uploaded_files else 0} Arquivo(s)",
+                use_container_width=True,
+                type="primary",
+                disabled=not uploaded_files,
+            )
+        with c_btn2:
+            limpar = st.button("Limpar fila", use_container_width=True)
         if limpar:
             st.session_state.upload_nonce += 1
             st.rerun()
@@ -482,15 +591,19 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
     st.subheader("📚 Documentos & Auditoria Assistida")
 
     # Upload integrado (substitui aba "Processar")
-    with st.expander("📤 Upload & Processamento", expanded=False):
+    with st.expander("📤 Upload & Processamento", expanded=True):
         up_col1, up_col2 = st.columns([3, 2])
         with up_col1:
+            only_xml = getattr(orch, "ONLY_XML", True)
+            label = "Selecione XML" if only_xml else "Selecione XML / PDF / Imagem"
+            types = ["xml"] if only_xml else ["xml", "pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp"]
+            help_txt = ("Somente XML é aceito neste modo." if only_xml else "Você pode selecionar múltiplos arquivos.")
             uploaded_files = st.file_uploader(
-                "Selecione XML / PDF / Imagem",
-                type=["xml", "pdf", "jpg", "jpeg", "png", "tif", "tiff", "bmp"],
+                label,
+                type=types,
                 accept_multiple_files=True,
                 key=f"uploader_{st.session_state.upload_nonce}",
-                help="Você pode selecionar múltiplos arquivos.",
+                help=help_txt,
             )
         with up_col2:
             origem = st.text_input("Origem (rótulo livre)", value="upload_ui")
@@ -564,38 +677,40 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
 
     # Grid de documentos
     try:
-        expected = [
-            "id","status","motivo_rejeicao","chave_acesso","data_emissao","valor_total",
-            # Emitente
-            "emitente_nome","emitente_cnpj","emitente_cpf","emitente_ie",
-            "emitente_uf","emitente_municipio","emitente_bairro","emitente_logradouro",
-            "emitente_numero","emitente_cep",
-            # Destinatário
-            "destinatario_nome","destinatario_cnpj","destinatario_cpf","destinatario_ie",
-            "destinatario_uf","destinatario_municipio","destinatario_bairro","destinatario_logradouro",
-            "destinatario_numero","destinatario_cep",
-            # Meta
-            "tipo","serie","numero_nota","nome_arquivo","origem"
-        ]
         df_docs_raw = db.query_table("documentos", where=where_clause)
-        df_docs = tidy_dataframe(df_docs_raw, expected_cols=expected, mask_id_cols=True)
+        df_docs = tidy_dataframe(df_docs_raw, mask_id_cols=True)
+        df_docs = with_composed_addresses(df_docs)
         if "data_emissao" in df_docs.columns:
             df_docs["data_emissao"] = pd.to_datetime(df_docs["data_emissao"], errors="coerce").dt.date
 
-        cols_show = [
-            "id","nome_arquivo","tipo","status","data_emissao","valor_total",
-            # Emitente
-            "emitente_nome","emitente_cnpj","emitente_cpf","emitente_uf","emitente_municipio",
-            "emitente_logradouro","emitente_numero","emitente_bairro","emitente_cep",
-            # Destinatário
-            "destinatario_nome","destinatario_cnpj","destinatario_cpf","destinatario_uf","destinatario_municipio",
-            "destinatario_logradouro","destinatario_numero","destinatario_bairro","destinatario_cep",
-            # Demais
-            "serie","numero_nota","chave_acesso","origem","motivo_rejeicao"
-        ]
-        cols_exist = [c for c in cols_show if c in df_docs.columns]
+        view = pd.DataFrame()
+        if not df_docs.empty:
+            view = pd.DataFrame({
+                "id": df_docs.get("id"),
+                "nome_arquivo": df_docs.get("nome_arquivo"),
+                "tipo": df_docs.get("tipo"),
+                "status": df_docs.get("status"),
+                "data_emissao": df_docs.get("data_emissao"),
+                "valor_total": df_docs.get("valor_total"),
+                "emitente_nome": df_docs.get("emitente_nome"),
+                "emitente_doc": df_docs.get("emitente_cnpj", df_docs.get("emitente_cpf")),
+                "emitente_uf": df_docs.get("emitente_uf"),
+                "destinatario_nome": df_docs.get("destinatario_nome"),
+                "destinatario_doc": df_docs.get("destinatario_cnpj", df_docs.get("destinatario_cpf")),
+                "destinatario_uf": df_docs.get("destinatario_uf"),
+                "end_emitente": df_docs.get("emitente_endereco_full"),
+                "end_dest": df_docs.get("destinatario_endereco_full"),
+                "serie": df_docs.get("serie"),
+                "numero_nota": df_docs.get("numero_nota"),
+                "chave_acesso": df_docs.get("chave_acesso"),
+                "origem": df_docs.get("origem"),
+                "motivo_rejeicao": df_docs.get("motivo_rejeicao"),
+            })
+            view = tidy_dataframe(view, mask_id_cols=True)
+            view = reduce_empty_columns(view, keep=["id","nome_arquivo","tipo","status","data_emissao","valor_total","emitente_nome","destinatario_nome"]) 
+
         st.data_editor(
-            df_docs[cols_exist],
+            view,
             use_container_width=True, height=430, disabled=True,
             column_config={
                 "data_emissao": st.column_config.DateColumn("Data Emissão", format="YYYY-MM-DD"),
@@ -603,6 +718,10 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
             },
             key="grid_docs_ro"
         )
+        # Ações de exportação
+        exp_c1, exp_c2 = st.columns([1,6])
+        with exp_c1:
+            download_button_for_df(view, "⬇️ Exportar CSV", "documentos.csv")
     except Exception as e:
         st.error(f"Erro ao listar documentos: {e}")
         st.code(traceback.format_exc(), language="python")
@@ -611,12 +730,14 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
     st.markdown("---")
     st.subheader("🔎 Detalhe do Documento e Auditoria")
 
-    d1, d2, d3 = st.columns([1, 1, 2])
-    with d1:
-        doc_id = st.number_input("Documento ID", min_value=0, step=1, key="doc_id_detail")
-    with d2:
+    # Linha compacta: label + campo + botão alinhados
+    st.markdown("**Documento ID**")
+    c_id, c_btn, c_dl = st.columns([0.6, 0.6, 2])
+    with c_id:
+        doc_id = st.number_input(label="", min_value=0, step=1, key="doc_id_detail")
+    with c_btn:
         abrir = st.button("Abrir Detalhe", type="primary", use_container_width=True, disabled=(doc_id == 0))
-    with d3:
+    with c_dl:
         if doc_id > 0:
             try:
                 data_zip = _download_pacote_documento(db, int(doc_id))
@@ -641,59 +762,112 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
 
         doc_status = doc.get("status")
         status_color = "green" if doc_status in ("processado", "revisado") else ("yellow" if doc_status == "revisao_pendente" else "red")
-        st.markdown(
-            f"<div class='hgroup'>"
-            f"{status_chip(f'Status: {doc_status}', status_color)}"
-            f"{score_pill('Cobertura NLP', coverage)}"
-            f"{score_pill('Sanidade', sanity)}"
-            f"{score_pill('Match XML', match_score)}"
-            f"</div>", unsafe_allow_html=True
-        )
-
-        # Split view: OCR ↔ XML/Associação
-        col_left, col_right = st.columns([3, 2], gap="large")
-        with col_left:
-            st.markdown("#### 📄 Documento (OCR & Texto)")
+        try:
+            # Monta DataFrame de cabeçalho para o documento selecionado
             header_df = tidy_dataframe(pd.DataFrame([doc]), mask_id_cols=True)
+            header_df = with_composed_addresses(header_df)
             if "data_emissao" in header_df.columns:
                 header_df["data_emissao"] = pd.to_datetime(header_df["data_emissao"], errors="coerce").dt.date
-            st.data_editor(header_df[[
-                c for c in [
-                    "id","nome_arquivo","tipo","data_emissao","valor_total",
-                    # Emitente
-                    "emitente_nome","emitente_cnpj","emitente_cpf","emitente_uf","emitente_municipio",
-                    "emitente_logradouro","emitente_numero","emitente_bairro","emitente_cep",
-                    # Destinatário
-                    "destinatario_nome","destinatario_cnpj","destinatario_cpf","destinatario_uf","destinatario_municipio",
-                    "destinatario_logradouro","destinatario_numero","destinatario_bairro","destinatario_cep",
-                    # Estado
-                    "status","serie","numero_nota","chave_acesso","motivo_rejeicao"
-                ] if c in header_df.columns
-            ]], use_container_width=True, height=220, disabled=True, key=f"doc_header_{doc_id}")
 
-            st.markdown("**Texto OCR (amostra)**")
-            ocr_text = _extracao_ocr_text(db, int(doc_id))
-            st.text_area("OCR", ocr_text[:20000], height=240)
+            # Faixa de status e pontuações
+            st.markdown(
+                f"<div class='hgroup'>"
+                f"{status_chip(f'Status: {doc_status}', status_color)}"
+                f"{score_pill('Sanidade', sanity)}"
+                f"{score_pill('Match XML', match_score)}"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
-        with col_right:
-            st.markdown("#### 🧷 XML & Associação")
-            assoc = (meta.get("associacao") or {})
-            if assoc:
-                st.json(assoc)
-                diffs = assoc.get("diffs") or assoc.get("divergencias")
-                if diffs:
-                    st.markdown("**Divergências OCR ↔ XML**")
-                    st.json(diffs)
-            else:
-                st.info("Sem metadados de associação registrados.")
+            # Campos de exibição (emitente/destinatário)
+            e_doc = pick(header_df, ["emitente_cnpj", "emitente_cpf"])
+            e_nome = pick(header_df, ["emitente_nome"])
+            e_uf   = pick(header_df, ["emitente_uf"])
+            e_end  = pick(header_df, ["emitente_endereco_full"])
+            d_doc = pick(header_df, ["destinatario_cnpj", "destinatario_cpf"])
+            d_nome = pick(header_df, ["destinatario_nome"])
+            d_uf   = pick(header_df, ["destinatario_uf"])
+            d_end  = pick(header_df, ["destinatario_endereco_full"])
 
-            st.markdown("#### ✅ Validações")
-            try:
-                st.write(f"- **CFOP**: {doc.get('cfop','—')}")
-                st.write(f"- **Emitente UF / Dest UF**: {doc.get('emitente_uf','—')} → {doc.get('destinatario_uf','—')}")
-                st.write(f"- **Valor Total**: {doc.get('valor_total','—')}")
-            except Exception:
-                pass
+            col_left, col_right = st.columns([2, 1])
+            with col_left:
+                st.markdown(
+                    "<div class='card'><h5>Emitente</h5>"
+                    f"<div><b>{mask_doc(str(e_doc)) if e_doc and str(e_doc).strip() not in ('', '—') else '—'}</b> – {e_nome or '—'}"
+                    f"<br/><span class='soft'>{e_end or '—'} (UF: {e_uf or '—'})</span></div></div>",
+                    unsafe_allow_html=True
+                )
+                st.markdown(
+                    "<div class='card'><h5>Destinatário</h5>"
+                    f"<div><b>{mask_doc(str(d_doc)) if d_doc and str(d_doc).strip() not in ('', '—') else '—'}</b> – {d_nome or '—'}"
+                    f"<br/><span class='soft'>{d_end or '—'} (UF: {d_uf or '—'})</span></div></div>",
+                    unsafe_allow_html=True
+                )
+
+                st.markdown(" ")
+                cols_to_show = [c for c in [
+                    "id","nome_arquivo","tipo","data_emissao","valor_total","status","serie","numero_nota","chave_acesso","motivo_rejeicao"
+                ] if c in header_df.columns]
+                st.data_editor(
+                    header_df[cols_to_show],
+                    use_container_width=True, height=120, disabled=True,
+                    key=f"doc_header_{doc_id}"
+                )
+
+            with col_right:
+                st.markdown("#### 🧷 XML")
+                if meta:
+                    basic = {k: meta.get(k) for k in ("versao_schema","protocolo_autorizacao","data_autorizacao") if k in meta}
+                    if basic:
+                        st.json(basic)
+                    else:
+                        st.info("Sem metadados adicionais do XML.")
+
+                st.markdown("#### ✅ Validações")
+                try:
+                    st.write(f"- CFOP: {doc.get('cfop','—')}")
+                    st.write(f"- Emitente UF / Dest UF: {doc.get('emitente_uf','—')} → {doc.get('destinatario_uf','—')}")
+                    st.write(f"- Valor Total: {doc.get('valor_total','—')}")
+                except Exception:
+                    pass
+        except Exception as e:
+            st.error(f"Erro ao carregar detalhe do documento: {e}")
+            st.code(traceback.format_exc(), language="python")
+
+        st.markdown("---")
+        # Tabela de Itens da Nota (com impostos por item quando disponível)
+        try:
+            df_itens = join_impostos_itens(db, int(doc_id))
+        except Exception:
+            df_itens = pd.DataFrame()
+        if df_itens is not None and not df_itens.empty:
+            st.markdown("#### 🧾 Itens da Nota")
+            cols_it_show = [c for c in [
+                "numero_item","descricao","codigo_produto","ncm","cfop","unidade",
+                "quantidade","valor_unitario","valor_total","desconto","outras_despesas",
+                "icms_valor","ipi_valor","pis_valor","cofins_valor","iss_valor",
+                "icms_aliquota","ipi_aliquota","pis_aliquota","cofins_aliquota","iss_aliquota"
+            ] if c in df_itens.columns]
+            st.data_editor(
+                df_itens[cols_it_show].sort_values(by=[c for c in ["numero_item","descricao"] if c in df_itens.columns]),
+                use_container_width=True, height=260, disabled=True,
+                column_config={
+                    "quantidade": st.column_config.NumberColumn("Quantidade", format="%.3f"),
+                    "valor_unitario": st.column_config.NumberColumn("Vlr Unit", format="R$ %.4f"),
+                    "valor_total": st.column_config.NumberColumn("Vlr Total", format="R$ %.2f"),
+                    "desconto": st.column_config.NumberColumn("Desc", format="R$ %.2f"),
+                    "outras_despesas": st.column_config.NumberColumn("Outras", format="R$ %.2f"),
+                    "icms_valor": st.column_config.NumberColumn("ICMS (R$)", format="R$ %.2f"),
+                    "ipi_valor": st.column_config.NumberColumn("IPI (R$)", format="R$ %.2f"),
+                    "pis_valor": st.column_config.NumberColumn("PIS (R$)", format="R$ %.2f"),
+                    "cofins_valor": st.column_config.NumberColumn("COFINS (R$)", format="R$ %.2f"),
+                    "iss_valor": st.column_config.NumberColumn("ISS (R$)", format="R$ %.2f"),
+                },
+                key=f"grid_itens_{doc_id}"
+            )
+            download_button_for_df(df_itens[cols_it_show], "⬇️ Exportar Itens (CSV)", f"itens_{int(doc_id)}.csv", help_text="Itens com impostos por item, quando disponíveis.")
+        else:
+            st.info("Sem itens registrados para este documento.")
 
         st.markdown("---")
         col_actions = st.columns(3)
@@ -757,15 +931,7 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
     def _render_chat_message(role: str, content: str):
         bubble_class = "chat-bubble-user" if role == "user" else "chat-bubble-assistant"
         with st.chat_message(role):
-            st.markdown(f"<div class='{bubble_class}'>{content}</div>", unsafe_allow_html=True)
-
-    for msg in history:
-        _render_chat_message(msg["role"], msg["content"])
-        if msg.get("table") is not None and isinstance(msg["table"], pd.DataFrame) and not msg["table"].empty:
-            st.data_editor(tidy_dataframe(msg["table"]), use_container_width=True, height=320, disabled=True, key=f"chat_tbl_{id(msg)}")
-        if st.session_state.chat_show_code and msg.get("code"):
-            with st.expander("Código/Query utilizado nesta resposta"):
-                st.code(msg["code"], language="python")
+            st.markdown(f"<div class='chat-wrap'><div class='chat-meta'>{'Você' if role=='user' else 'Assistente'}</div><div class='{bubble_class}'>{content}</div></div>", unsafe_allow_html=True)
 
     user_input = st.chat_input("Pergunte algo… ex.: 'Top 5 emitentes por valor total'")
     col_l, col_r = st.columns([7, 3])
@@ -777,7 +943,6 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
     if user_input:
         history.append({"role": "user", "content": user_input})
         st.session_state.chat_llm_history = history
-        _render_chat_message("user", user_input)
         with st.spinner("Analisando..."):
             try:
                 scope = st.session_state.chat_scope
@@ -788,17 +953,38 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
                 agent_name = out.get("agent_name", "N/A")
                 dur = out.get("duracao_s", 0.0)
                 assistant_msg = f"**Agente:** {agent_name}  \n**Tempo:** {float(dur):.2f}s\n\n{answer_text}"
-                _render_chat_message("assistant", assistant_msg)
-                if isinstance(answer_table, pd.DataFrame) and not answer_table.empty:
-                    st.data_editor(tidy_dataframe(answer_table), use_container_width=True, height=360, disabled=True, key=f"ans_tbl_{len(history)}")
-                if show_code and answer_code:
-                    with st.expander("Código/Query desta resposta"):
-                        st.code(answer_code, language="python")
-                history.append({"role": "assistant","content": assistant_msg,"table": answer_table if isinstance(answer_table, pd.DataFrame) else None,"code": answer_code})
+                history.append({
+                    "role": "assistant",
+                    "content": assistant_msg,
+                    "table": answer_table if isinstance(answer_table, pd.DataFrame) else None,
+                    "code": answer_code,
+                    "figuras": out.get("figuras") if isinstance(out.get("figuras"), list) else []
+                })
                 st.session_state.chat_llm_history = history
             except Exception as e:
                 st.error(f"Falha ao responder: {e}")
                 st.code(traceback.format_exc(), language="python")
+
+    # Preferência de ordenação de mensagens e renderização do histórico (após possível nova interação)
+    order_desc = st.toggle("Mensagens mais recentes no topo", value=True, key="chat_order_desc")
+    render_iter = reversed(history) if order_desc else history
+    for msg in render_iter:
+        _render_chat_message(msg["role"], msg["content"])
+        if msg.get("table") is not None and isinstance(msg["table"], pd.DataFrame) and not msg["table"].empty:
+            st.data_editor(tidy_dataframe(msg["table"]), use_container_width=True, height=320, disabled=True, key=f"chat_tbl_{id(msg)}")
+        if st.session_state.chat_show_code and msg.get("code"):
+            with st.expander("Código/Query utilizado nesta resposta"):
+                st.code(msg["code"], language="python")
+        figs = msg.get("figuras") or []
+        if isinstance(figs, list) and figs:
+            for idx, fig in enumerate(figs):
+                try:
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    try:
+                        st.pyplot(fig, use_container_width=True)
+                    except Exception:
+                        pass
 
 def tab_metricas(orch: Orchestrator, db: BancoDeDados):
     st.subheader("📊 Métricas & Insights")
