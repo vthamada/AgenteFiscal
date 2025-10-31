@@ -559,7 +559,7 @@ def ui_header(db: BancoDeDados):
         try:
             only_xml = (os.getenv("ONLY_XML", "1").strip().lower() in {"1","true","yes","on"})
             if only_xml:
-                st.info("Modo Somente XML ativo: envie apenas arquivos .xml fiscais. PDFs/Imagens serão encaminhados para quarentena.")
+                st.info("Modo Somente XML ativo: envie apenas arquivos .xml fiscais.")
         except Exception:
             pass
     with right:
