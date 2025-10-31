@@ -14,6 +14,7 @@ import pandas as pd
 from dotenv import load_dotenv
 import secrets
 from datetime import datetime, timedelta, timezone
+import re
 
 # =================== Config da Página & Tema ===================
 st.set_page_config(
@@ -166,6 +167,113 @@ def compose_short_address(row: pd.Series, prefix: str) -> str:
             parts.append(str(row[col]).strip())
     return ", ".join(parts)
 
+# ====== Derivação de partes de endereço a partir de uma string ======
+UF_SET = {
+    "AC","AL","AM","AP","BA","CE","DF","ES","GO","MA","MG","MS","MT",
+    "PA","PB","PE","PI","PR","RJ","RN","RO","RR","RS","SC","SE","SP","TO"
+}
+
+def _normalize_cep(val: str | None) -> Optional[str]:
+    try:
+        s = re.sub(r"\D", "", str(val or ""))
+        if len(s) == 8:
+            return f"{s[:5]}-{s[5:]}"
+        return val
+    except Exception:
+        return val
+
+def parse_address_guess(addr: str | None) -> Dict[str, Optional[str]]:
+    """Heurística simples para extrair bairro, município, UF e CEP de uma string de endereço.
+    Funciona melhor para formatos do tipo: 'Rua X, 123, Bairro Y, Cidade Z, UF, 00000000'.
+    """
+    out: Dict[str, Optional[str]] = {"bairro": None, "municipio": None, "uf": None, "cep": None}
+    if not addr or not str(addr).strip():
+        return out
+    s = str(addr)
+    try:
+        # CEP (prioriza último padrão na string)
+        m_cep = list(re.finditer(r"(\b\d{5}-?\d{3}\b|\b\d{8}\b)", s))
+        if m_cep:
+            out["cep"] = _normalize_cep(m_cep[-1].group(0))
+        # Tokenização leve por vírgula/semicolon
+        tokens = [t.strip() for t in re.split(r"[,;]", s) if t.strip()]
+        has_letters = lambda x: bool(re.search(r"[A-Za-zÀ-ÿ]", x))
+        only_digits = lambda x: bool(re.fullmatch(r"\d+", x.replace("-", "")))
+        # UF: procura o último token com 2 letras em UF_SET
+        uf_idx = -1
+        for i in range(len(tokens) - 1, -1, -1):
+            tok = tokens[i].upper().strip()
+            if tok in UF_SET:
+                out["uf"] = tok
+                uf_idx = i
+                break
+        # Conjunto de tokens relevantes (com letras), antes da UF (se houver)
+        search_upto = uf_idx if uf_idx != -1 else len(tokens)
+        candidates = [t for t in tokens[:search_upto] if has_letters(t)]
+        # Município: último token alfabético antes da UF (ou do fim)
+        if candidates:
+            out["municipio"] = candidates[-1].strip()
+            # Bairro: token alfabético imediatamente anterior ao município
+            if len(candidates) >= 2:
+                out["bairro"] = candidates[-2].strip()
+        # Caso não tenha havido divisão por vírgulas adequada, tenta extrair cidade do último trecho
+        if not out["municipio"]:
+            tail = tokens[-1] if tokens else s
+            # remove números/CEP do final
+            tail = re.sub(r"(\d{5}-?\d{3})$", "", tail).strip()
+            # pega últimas palavras com letras
+            m = re.findall(r"([A-Za-zÀ-ÿ]{2,}(?:\s+[A-Za-zÀ-ÿ]{2,})*)", tail)
+            if m:
+                out["municipio"] = m[-1].strip()
+        # Saneia CEPs/números indevidos em bairro
+        if out["bairro"] and (only_digits(out["bairro"]) or re.fullmatch(r"\d{5}-?\d{3}", out["bairro"])):
+            out["bairro"] = None
+    except Exception:
+        pass
+    return out
+
+def with_derived_address_parts(df: pd.DataFrame) -> pd.DataFrame:
+    """Preenche campos faltantes de bairro/CEP/município/UF a partir de strings de endereço.
+    Não altera valores já preenchidos; atua apenas onde estiver vazio.
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    def _is_empty(v: Any) -> bool:
+        try:
+            if v is None:
+                return True
+            if isinstance(v, float) and pd.isna(v):
+                return True
+            s = str(v).strip()
+            return s == "" or s.lower() == "none"
+        except Exception:
+            return False
+
+    for prefix in ("emitente", "destinatario"):
+        col_full = f"{prefix}_endereco_full"
+        col_curto = f"{prefix}_endereco_curto"
+        col_any = col_full if col_full in df.columns else (col_curto if col_curto in df.columns else None)
+        if not col_any:
+            continue
+
+        def _fill_row(row: pd.Series) -> pd.Series:
+            addr = row.get(col_any)
+            parts = parse_address_guess(addr)
+            tgt = {
+                "bairro": f"{prefix}_bairro",
+                "municipio": f"{prefix}_municipio",
+                "uf": f"{prefix}_uf",
+                "cep": f"{prefix}_cep",
+            }
+            for k, c in tgt.items():
+                if c in row.index and _is_empty(row.get(c)) and parts.get(k):
+                    row[c] = parts.get(k)
+            return row
+
+        df = df.apply(_fill_row, axis=1)
+    return df
+
 def with_composed_addresses(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -178,6 +286,7 @@ def with_composed_addresses(df: pd.DataFrame) -> pd.DataFrame:
         df["destinatario_endereco_curto"] = df.apply(lambda r: compose_short_address(r, "destinatario"), axis=1)
     except Exception:
         pass
+    # Revertido ao padrão anterior: não derivar partes de endereço automaticamente
     return df
 
 def join_impostos_itens(db: "BancoDeDados", documento_id: int) -> pd.DataFrame:
@@ -479,8 +588,7 @@ def ui_sidebar(db: BancoDeDados):
     with st.sidebar:
         st.markdown(f"**👤 {st.session_state.user_name or 'Usuário'}**")
         st.caption(f"Perfil: {st.session_state.user_profile or '—'}")
-
-        if st.button("Sair", width='stretch'):
+        if st.button("Sair", use_container_width=True):
             # Revoga token e remove da URL
             tok = _qp_get("auth")
             if tok:
@@ -538,7 +646,7 @@ def ui_sidebar(db: BancoDeDados):
             model = None
         
         key = st.text_input("Chave API (opcional; usa env se vazio)", value=st.session_state.llm_api_key, type="password")
-        if st.button("Aplicar", width='stretch'):
+        if st.button("Aplicar", use_container_width=True):
             # Atualiza session state antes de configurar
             st.session_state.llm_provider = prov
             st.session_state.llm_model = model
@@ -574,12 +682,12 @@ def tab_processar(orch: Orchestrator, db: BancoDeDados):
         with c_btn1:
             ingest = st.button(
                 f"Ingerir {len(uploaded_files) if uploaded_files else 0} Arquivo(s)",
-                width='stretch',
                 type="primary",
                 disabled=not uploaded_files,
+                use_container_width=True,
             )
         with c_btn2:
-            limpar = st.button("Limpar fila", width='stretch')
+            limpar = st.button("Limpar fila", use_container_width=True)
         if limpar:
             st.session_state.upload_nonce += 1
             st.rerun()
@@ -683,14 +791,7 @@ def _download_pacote_documento(db: BancoDeDados, doc_id: int) -> bytes:
     buf.seek(0)
     return buf.read()
 
-def _extracao_ocr_text(db: BancoDeDados, doc_id: int) -> str:
-    try:
-        df = db.query_table("extracoes", where=f"documento_id = {doc_id} AND agente = 'OCRAgent'")
-        if not df.empty and "texto_extraido" in df.columns:
-            return str(df.iloc[-1]["texto_extraido"] or "")[:200000]
-    except Exception:
-        pass
-    return ""
+# OCR removido do sistema — não utilizamos mais a tabela 'extracoes' na UI.
 
 def _render_cognitive_timeline(meta: Dict[str, Any]):
     decisions = ((meta.get("blackboard") or {}).get("decisions")) or []
@@ -726,11 +827,11 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
             origem = st.text_input("Origem (rótulo livre)", value="upload_ui")
             ingest = st.button(
                 f"Ingerir {len(uploaded_files) if uploaded_files else 0} Arquivo(s)",
-                width='stretch',
                 type="primary",
                 disabled=not uploaded_files,
+                use_container_width=True,
             )
-            limpar = st.button("Limpar fila", width='stretch')
+            limpar = st.button("Limpar fila", use_container_width=True)
             if limpar:
                 st.session_state.upload_nonce += 1
                 st.rerun()
@@ -774,7 +875,7 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
             st.rerun()
 
     # Filtros persistentes
-    f1, f2, f3, f4, f5 = st.columns([1.1, 1.1, 0.8, 1.1, 1.1])
+    f1, f2, f3, f4, f5, f6 = st.columns([1.1, 1.1, 0.8, 1.1, 1.1, 1.0])
     with f1:
         st.session_state.filter_status = st.selectbox(
             "Status",
@@ -789,6 +890,8 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
         st.session_state.filter_date_from = st.date_input("De", value=st.session_state.filter_date_from)
     with f5:
         st.session_state.filter_date_to = st.date_input("Até", value=st.session_state.filter_date_to)
+    with f6:
+        filtro_risco_min = st.slider("Risco mínimo", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
 
     where_clause = _montar_where_docs()
 
@@ -799,6 +902,23 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
         df_docs = with_composed_addresses(df_docs)
         if "data_emissao" in df_docs.columns:
             df_docs["data_emissao"] = pd.to_datetime(df_docs["data_emissao"], errors="coerce").dt.date
+        # Risco derivado de meta_json (se existir)
+        if "meta_json" in df_docs.columns:
+            def _risk_from_meta(x: str) -> float:
+                try:
+                    m = json.loads(x or "{}")
+                    return float(((m.get("risk") or {}).get("score") or 0.0))
+                except Exception:
+                    return 0.0
+            df_docs["risco"] = df_docs["meta_json"].apply(_risk_from_meta)
+            def _dup_count(x: str) -> int:
+                try:
+                    m = json.loads(x or "{}")
+                    dups = ((m.get("risk") or {}).get("duplicates") or [])
+                    return int(len(dups))
+                except Exception:
+                    return 0
+            df_docs["dup"] = df_docs["meta_json"].apply(_dup_count)
 
         view = pd.DataFrame()
         if not df_docs.empty:
@@ -809,22 +929,16 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                 "status": df_docs.get("status"),
                 "data_emissao": df_docs.get("data_emissao"),
                 "valor_total": df_docs.get("valor_total"),
+                "risco": df_docs.get("risco"),
+                "dup": df_docs.get("dup"),
                 "emitente_nome": df_docs.get("emitente_nome"),
                 "emitente_doc": df_docs.get("emitente_cnpj", df_docs.get("emitente_cpf")),
                 "emitente_uf": df_docs.get("emitente_uf"),
                 "destinatario_nome": df_docs.get("destinatario_nome"),
                 "destinatario_doc": df_docs.get("destinatario_cnpj", df_docs.get("destinatario_cpf")),
                 "destinatario_uf": df_docs.get("destinatario_uf"),
-                # Endereços separados (concisos) para Emitente/Destinatário
                 "emit_endereco": df_docs.get("emitente_endereco_curto"),
-                "emit_bairro": df_docs.get("emitente_bairro"),
-                "emit_cep": df_docs.get("emitente_cep"),
-                "emit_municipio": df_docs.get("emitente_municipio"),
-                # UF já presente nas colunas dedicadas 'emitente_uf' e 'destinatario_uf'
                 "dest_endereco": df_docs.get("destinatario_endereco_curto"),
-                "dest_bairro": df_docs.get("destinatario_bairro"),
-                "dest_cep": df_docs.get("destinatario_cep"),
-                "dest_municipio": df_docs.get("destinatario_municipio"),
                 "serie": df_docs.get("serie"),
                 "numero_nota": df_docs.get("numero_nota"),
                 "chave_acesso": df_docs.get("chave_acesso"),
@@ -832,11 +946,28 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                 "motivo_rejeicao": df_docs.get("motivo_rejeicao"),
             })
             view = tidy_dataframe(view, mask_id_cols=True)
-            view = reduce_empty_columns(view, keep=["id","nome_arquivo","tipo","status","data_emissao","valor_total","emitente_nome","destinatario_nome"]) 
+            # filtro por risco mínimo
+            try:
+                if "risco" in view.columns and filtro_risco_min > 0.0:
+                    view = view[view["risco"].fillna(0) >= float(filtro_risco_min)]
+            except Exception:
+                pass
+            # Mantém colunas de endereço desmembradas visíveis (mesmo se houver muitos vazios)
+            view = reduce_empty_columns(
+                view,
+                keep=[
+                    "id","nome_arquivo","tipo","status","data_emissao","valor_total","risco","dup",
+                    "emitente_nome","destinatario_nome",
+                    # Endereço do Emitente
+                    "emitente_uf","emit_endereco","emit_bairro","emit_cep","emit_municipio",
+                    # Endereço do Destinatário
+                    "destinatario_uf","dest_endereco","dest_bairro","dest_cep","dest_municipio",
+                ]
+            ) 
 
         st.data_editor(
             view,
-            width='stretch', height=430, disabled=True,
+            use_container_width=True, height=430, disabled=True,
             column_config={
                 "id": st.column_config.NumberColumn("ID", format="%d", step=1),
                 "nome_arquivo": st.column_config.TextColumn("Arquivo"),
@@ -844,6 +975,8 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                 "status": st.column_config.TextColumn("Status"),
                 "data_emissao": st.column_config.DateColumn("Data Emissão", format="YYYY-MM-DD"),
                 "valor_total":  st.column_config.NumberColumn("Valor Total (R$)", format="R$ %.2f", step=0.01),
+                "risco": st.column_config.NumberColumn("Risco (0-1)", format="%.2f"),
+                "dup": st.column_config.NumberColumn("Dup", help="Qtd de possíveis duplicidades"),
                 "emitente_nome": st.column_config.TextColumn("Emitente"),
                 "emitente_doc": st.column_config.TextColumn("Emitente Doc"),
                 "emitente_uf": st.column_config.TextColumn("Emitente UF"),
@@ -852,13 +985,7 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                 "destinatario_uf": st.column_config.TextColumn("Dest UF"),
                 # Colunas de endereço separadas (solicitado)
                 "emit_endereco": st.column_config.TextColumn("Emitente Endereço"),
-                "emit_bairro": st.column_config.TextColumn("Emitente Bairro"),
-                "emit_cep": st.column_config.TextColumn("Emitente CEP"),
-                "emit_municipio": st.column_config.TextColumn("Emitente Município"),
                 "dest_endereco": st.column_config.TextColumn("Dest. Endereço"),
-                "dest_bairro": st.column_config.TextColumn("Dest. Bairro"),
-                "dest_cep": st.column_config.TextColumn("Dest. CEP"),
-                "dest_municipio": st.column_config.TextColumn("Dest. Município"),
                 "serie": st.column_config.TextColumn("Série"),
                 "numero_nota": st.column_config.TextColumn("Número"),
                 "chave_acesso": st.column_config.TextColumn("Chave de Acesso"),
@@ -885,7 +1012,7 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
     with c_id:
         doc_id = st.number_input(label="Documento ID", label_visibility="collapsed", min_value=0, step=1, key="doc_id_detail")
     with c_btn:
-        abrir = st.button("Abrir Detalhe", type="primary", width='stretch', disabled=(doc_id == 0))
+        abrir = st.button("Abrir Detalhe", type="primary", use_container_width=True, disabled=(doc_id == 0))
     with c_dl:
         if doc_id > 0:
             try:
@@ -895,13 +1022,18 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                     data=data_zip,
                     file_name=f"documento_{int(doc_id)}.zip",
                     mime="application/zip",
-                    width='stretch'
+                    use_container_width=True
                 )
             except Exception:
                 pass
 
+    # Mantém o documento aberto no estado para interações (ex.: RAG) sem perder a seção
     if abrir and doc_id > 0:
-        doc = db.get_documento(int(doc_id))
+        st.session_state.doc_open_id = int(doc_id)
+
+    open_id = int(st.session_state.get("doc_open_id", 0) or 0)
+    if open_id > 0 and int(doc_id) == open_id:
+        doc = db.get_documento(open_id)
         if not doc:
             st.warning("Documento não encontrado.")
             return
@@ -959,11 +1091,39 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                 ] if c in header_df.columns]
                 st.data_editor(
                     header_df[cols_to_show],
-                    width='stretch', height=120, disabled=True,
+                    use_container_width=True, height=120, disabled=True,
                     key=f"doc_header_{doc_id}"
                 )
 
                 # Removidos: Endereços detalhados, XML e Validações (solicitado)
+                # Duplicatas detectadas (se houver)
+                try:
+                    dup_ids = []
+                    r = (meta.get("risk") or {})
+                    if isinstance(r.get("duplicates"), list):
+                        dup_ids = [int(x) for x in r.get("duplicates") if str(x).isdigit()]
+                    if dup_ids:
+                        st.markdown(" ")
+                        with st.expander("🧭 Possíveis Duplicatas", expanded=False):
+                            df_all = tidy_dataframe(db.query_table("documentos"))
+                            df_dups = df_all[df_all["id"].isin(dup_ids)] if not df_all.empty else pd.DataFrame()
+                            if not df_dups.empty:
+                                cols = [c for c in ["id","nome_arquivo","tipo","data_emissao","emitente_nome","valor_total","status"] if c in df_dups.columns]
+                                st.data_editor(df_dups[cols], use_container_width=True, height=220, disabled=True, key=f"dup_tbl_{doc_id}")
+                                # Ações rápidas: abrir cada duplicata
+                                for did in dup_ids[:20]:
+                                    c1, c2 = st.columns([6,2])
+                                    with c1:
+                                        st.caption(f"Documento duplicado ID {did}")
+                                    with c2:
+                                        if st.button("Abrir", key=f"open_dup_{doc_id}_{did}"):
+                                            st.session_state.doc_id_detail = int(did)
+                                            st.session_state.doc_open_id = int(did)
+                                            st.rerun()
+                            else:
+                                st.info("IDs de duplicatas presentes, mas não foram encontrados na base.")
+                except Exception:
+                    pass
         except Exception as e:
             st.error(f"Erro ao carregar detalhe do documento: {e}")
             st.code(traceback.format_exc(), language="python")
@@ -1006,7 +1166,7 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
             df_view = df_itens[cols_show].sort_values(by=[c for c in ["numero_item","descricao"] if c in df_itens.columns])
             edited_df = st.data_editor(
                 df_view,
-                width='stretch', height=320,
+                use_container_width=True, height=320,
                 disabled=non_editable,
                 column_config=column_config,
                 key=f"grid_itens_single_{doc_id}"
@@ -1046,7 +1206,7 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
 
         st.markdown("---")
         col_actions = st.columns(3)
-        if col_actions[0].button("✅ Aprovar (Processado)", width='stretch'):
+        if col_actions[0].button("✅ Aprovar (Processado)", use_container_width=True):
             try:
                 db.atualizar_documento_campo(int(doc_id), "status", "processado")
                 db.atualizar_documento_campo(int(doc_id), "motivo_rejeicao", "Aprovado manualmente")
@@ -1055,12 +1215,12 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
             except Exception as e:
                 st.error(f"Falha ao aprovar: {e}")
 
-        if col_actions[1].button("🔁 Reprocessar", width='stretch'):
+        if col_actions[1].button("🔁 Reprocessar", use_container_width=True):
             with st.spinner("Reprocessando..."):
                 out = orch.reprocessar_documento(int(doc_id))
                 st.info(out.get("mensagem"))
 
-        if col_actions[2].button("♻️ Revalidar", width='stretch'):
+        if col_actions[2].button("♻️ Revalidar", use_container_width=True):
             with st.spinner("Revalidando..."):
                 out = orch.revalidar_documento(int(doc_id))
                 if out.get("ok"):
@@ -1076,6 +1236,40 @@ def tab_auditoria(orch: Orchestrator, db: BancoDeDados):
                 st.info("Sem meta_json no documento.")
         with st.expander("🧭 Timeline Cognitiva (Blackboard Decisions)", expanded=True):
             _render_cognitive_timeline(meta)
+
+        # Contexto RAG (consulta semântica opcional por documento)
+        st.markdown("---")
+        with st.expander("🔎 Contexto RAG (semântico)", expanded=False):
+            qcol, act = st.columns([4,1])
+            with qcol:
+                qrag = st.text_input("Pergunta/termo para buscar no contexto deste documento", key=f"rag_q_{doc_id}")
+            with act:
+                buscar = st.button("Buscar", key=f"rag_btn_{doc_id}")
+            try:
+                # Exibe chunks já indexados quando não há pergunta
+                if not qrag:
+                    df_chunks = db.query_table("rag_chunks", where=f"documento_id = {int(doc_id)}", limit=10)
+                    if df_chunks is not None and not df_chunks.empty:
+                        st.data_editor(df_chunks[[c for c in ["source","chunk"] if c in df_chunks.columns]], use_container_width=True, height=240, disabled=True, key=f"rag_chunks_{doc_id}")
+                    else:
+                        st.info("Ainda não há contexto indexado para este documento.")
+                elif buscar:
+                    if getattr(orch, "rag", None) is None:
+                        st.warning("RAG não está configurado (verifique provider e chave da API de embeddings).")
+                    else:
+                        with st.spinner("Buscando no contexto..."):
+                            # Garante indexação deste documento e busca
+                            try:
+                                orch.rag.index_documents([int(doc_id)])
+                            except Exception:
+                                pass
+                            out = orch.rag.query(qrag, scope_doc_ids=[int(doc_id)], top_k=6)
+                            if out is not None and not out.empty:
+                                st.data_editor(out, use_container_width=True, height=260, disabled=True, key=f"rag_res_{doc_id}")
+                            else:
+                                st.info("Nenhum trecho relevante encontrado para a consulta.")
+            except Exception as e:
+                st.error(f"Falha ao consultar RAG: {e}")
 
 def tab_analises(orch: Orchestrator, db: BancoDeDados):
     st.subheader("🤖 Análises & LLM (Chat)")
@@ -1145,6 +1339,21 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
     render_iter = reversed(history) if order_desc else history
     for msg in render_iter:
         _render_chat_message(msg["role"], msg["content"], msg.get("ts"))
+        # Insight card (opcional)
+        ic = msg.get("insight_card")
+        if isinstance(ic, dict) and ic:
+            try:
+                title = ic.get("title") or ic.get("titulo") or "Insight"
+                body = ic.get("body") or ic.get("conteudo") or ic.get("text") or ""
+                with st.container(border=True):
+                    st.markdown(f"**{title}**")
+                    if isinstance(body, (str,)):
+                        st.markdown(_sanitize_markdown(body))
+                    elif isinstance(body, list):
+                        for it in body:
+                            st.markdown(f"- {it}")
+            except Exception:
+                pass
         # Blocos ricos: Tabela/Gráficos em abas; Código em dropdown (expander)
         has_tbl = (msg.get("table") is not None and isinstance(msg["table"], pd.DataFrame) and not msg["table"].empty)
         figs = msg.get("figuras") or []
@@ -1154,7 +1363,7 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
             t_idx = 0
             if has_tbl:
                 with tabs[t_idx]:
-                    st.data_editor(tidy_dataframe(msg["table"]), width='stretch', height=320, disabled=True, key=f"chat_tbl_{id(msg)}")
+                    st.data_editor(tidy_dataframe(msg["table"]), use_container_width=True, height=320, disabled=True, key=f"chat_tbl_{id(msg)}")
                 t_idx += 1
             if has_figs:
                 with tabs[t_idx]:
@@ -1176,7 +1385,7 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
     user_input = st.chat_input("Pergunte algo… ex.: 'Top 5 emitentes por valor total'")
     col_l, col_r = st.columns([7, 3])
     with col_r:
-        if st.button("🧹 Limpar conversa", width='stretch'):
+        if st.button("🧹 Limpar conversa", use_container_width=True):
             st.session_state.chat_llm_history = []
             # Limpa do banco também
             try:
@@ -1205,6 +1414,7 @@ def tab_analises(orch: Orchestrator, db: BancoDeDados):
                     "table": answer_table if isinstance(answer_table, pd.DataFrame) else None,
                     "code": answer_code,
                     "figuras": out.get("figuras") if isinstance(out.get("figuras"), list) else [],
+                    "insight_card": out.get("insight_card") if isinstance(out.get("insight_card"), dict) else None,
                     "ts": pd.Timestamp.utcnow().isoformat()
                 })
                 st.session_state.chat_llm_history = history
@@ -1232,7 +1442,7 @@ def tab_metricas(orch: Orchestrator, db: BancoDeDados):
     with title_col:
         st.caption("Acompanhe a qualidade do processamento, tempos e taxas de revisão/erro.")
     with act_col:
-        gerar_insights = st.button("Gerar Insights (LLM)", type="primary", width='stretch')
+        gerar_insights = st.button("Gerar Insights (LLM)", type="primary", use_container_width=True)
 
     try:
         df_metricas_raw = db.query_table("metricas")
@@ -1282,17 +1492,7 @@ def tab_metricas(orch: Orchestrator, db: BancoDeDados):
                 else:
                     st.info("Dados insuficientes.")
 
-        st.markdown("---")
-        st.subheader("⚠️ Documentos com Baixa Confiança (< 70%)")
-        df_baixa_raw = db.query_table("extracoes", where="confianca_media < 0.7")
-        df_baixa = tidy_dataframe(
-            df_baixa_raw,
-            expected_cols=["documento_id","agente","confianca_media","tempo_processamento"]
-        )
-        if not df_baixa.empty:
-            st.data_editor(df_baixa, width='stretch', height=220, disabled=True, key="grid_baixa_conf")
-        else:
-            st.info("Nenhum documento com confiança inferior a 70% encontrado.")
+        # Seção de baixa confiança removida (OCR/extrações fora de escopo no app)
 
         if gerar_insights:
             if st.session_state.llm_instance:
@@ -1336,12 +1536,21 @@ def tab_metricas(orch: Orchestrator, db: BancoDeDados):
 
 def tab_admin(db: BancoDeDados):
     st.subheader("⚙️ Administração")
-    a1, a2 = st.tabs(["Gerenciar Usuários", "Criar Novo Usuário"])
+    a1, a2, a3 = st.tabs(["Gerenciar Usuários", "Criar Novo Usuário", "Manutenção do Banco"])
 
     with a1:
         try:
             df_users_raw = db.query_table("usuarios")
             df_users = tidy_dataframe(df_users_raw, expected_cols=["id","nome","email","perfil"])
+            # Tipos seguros
+            if "id" in df_users.columns:
+                try:
+                    df_users["id"] = pd.to_numeric(df_users["id"], errors="coerce").astype("Int64")
+                except Exception:
+                    pass
+            if "perfil" in df_users.columns:
+                df_users["perfil"] = df_users["perfil"].fillna("").astype(str)
+
             cols_disp = ["id", "nome", "email", "perfil"]
             cols_exist = [c for c in cols_disp if c in df_users.columns]
             if not df_users.empty:
@@ -1350,9 +1559,11 @@ def tab_admin(db: BancoDeDados):
                 df_ui["Excluir"] = False
                 edited = st.data_editor(
                     df_ui,
-                    width='stretch',
-                    disabled=["id", "email"],
+                    use_container_width=True,
                     column_config={
+                        "id": st.column_config.NumberColumn("ID", format="%d", disabled=True),
+                        "email": st.column_config.TextColumn("Email", disabled=True),
+                        "nome": st.column_config.TextColumn("Nome"),
                         "perfil": st.column_config.SelectboxColumn(
                             "Perfil", options=["operador", "conferente", "admin"], required=True
                         ),
@@ -1445,11 +1656,46 @@ def tab_admin(db: BancoDeDados):
         logs_raw = db.query_table("logs")
         logs = tidy_dataframe(logs_raw, expected_cols=["id","timestamp","categoria","autor","mensagem"])
         if not logs.empty:
-            st.data_editor(logs.sort_values("id", ascending=False).head(limit), width='stretch', height=420, disabled=True, key="grid_logs")
+            st.data_editor(logs.sort_values("id", ascending=False).head(limit), use_container_width=True, height=420, disabled=True, key="grid_logs")
         else:
             st.info("Ainda não há logs registrados.")
     except Exception as e:
         st.error(f"Erro ao carregar logs: {e}")
+
+    with a3:
+        st.markdown("### 🧰 Manutenção do Banco (SQLite)")
+        st.caption("Operações seguras para melhorar performance e baixar backup.")
+        c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
+        with c1:
+            if st.button("ANALYZE", use_container_width=True):
+                try:
+                    db.analyze()
+                    st.success("ANALYZE executado.")
+                except Exception as e:
+                    st.error(f"Falha no ANALYZE: {e}")
+        with c2:
+            if st.button("VACUUM", use_container_width=True):
+                try:
+                    db.vacuum()
+                    st.success("VACUUM executado.")
+                except Exception as e:
+                    st.error(f"Falha no VACUUM: {e}")
+        with c3:
+            try:
+                # Gera snapshot de leitura do arquivo do banco
+                db_path = db.db_file_path()
+                data = b""
+                with open(db_path, "rb") as f:
+                    data = f.read()
+                st.download_button(
+                    "⬇️ Baixar snapshot do banco",
+                    data=data,
+                    file_name=db_path.name,
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Falha ao preparar snapshot: {e}")
 
 # =================== MAIN ===================
 def main():

@@ -333,8 +333,12 @@ class BancoDeDados:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_chave ON documentos(chave_acesso)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_emit_cnpj ON documentos(emitente_cnpj)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_dest_cnpj ON documentos(destinatario_cnpj)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_documentos_emit_nome ON documentos(emitente_nome)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_itens_doc ON itens(documento_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_itens_ncm ON itens(ncm)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_itens_cfop ON itens(cfop)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_impostos_item ON impostos(item_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_impostos_cst ON impostos(cst)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_docdet_doc ON documentos_detalhes(documento_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_docdet_chave ON documentos_detalhes(chave)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_config_chave_usuario ON config(chave, usuario)")
@@ -353,6 +357,22 @@ class BancoDeDados:
             self._ensure_column("documentos", "destinatario_complemento TEXT")
             self._ensure_column("documentos", "destinatario_bairro TEXT")
             self._ensure_column("documentos", "destinatario_cep TEXT")
+            # Tabela RAG para chunks de texto e embeddings
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rag_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    documento_id INTEGER NOT NULL,
+                    source TEXT,
+                    chunk TEXT,
+                    embedding_json TEXT,
+                    criado_em TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY(documento_id) REFERENCES documentos(id) ON DELETE CASCADE
+                )
+                """
+            )
+            self.conn.execute("CREATE INDEX IF NOT EXISTS ix_rag_doc ON rag_chunks(documento_id)")
+            self.conn.commit()
         except Exception:
             pass
 
@@ -630,7 +650,8 @@ class BancoDeDados:
         """
         allowed_tables = {
             "documentos", "itens", "impostos", "extracoes",
-            "logs", "memoria", "revisoes", "usuarios", "metricas", "documentos_detalhes", "config"
+            "logs", "memoria", "revisoes", "usuarios", "metricas", "documentos_detalhes", "config",
+            "rag_chunks"
         }
         if table not in allowed_tables:
             raise ValueError(f"Tabela não suportada: {table}")
@@ -691,3 +712,23 @@ class BancoDeDados:
             self.conn.close()
         except Exception:
             pass
+
+    # ------------------------- Manutenção do banco -------------------------
+    def analyze(self) -> None:
+        """Executa ANALYZE para atualizar estatísticas do SQLite."""
+        try:
+            self.conn.execute("ANALYZE")
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def vacuum(self) -> None:
+        """Executa VACUUM para compactação de arquivo e limpeza."""
+        try:
+            self.conn.execute("VACUUM")
+        except Exception:
+            pass
+
+    def db_file_path(self) -> Path:
+        """Retorna o caminho do arquivo físico do banco SQLite."""
+        return self.db_path

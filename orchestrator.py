@@ -23,6 +23,17 @@ try:
 except Exception:
     AgenteAnalitico = None  # type: ignore
 
+# RAG e Risco (opcionais)
+try:
+    from agentes.rag_retriever import SimpleRAG  # type: ignore
+except Exception:
+    SimpleRAG = None  # type: ignore
+try:
+    from agentes.risk_agent import compute_risk_score, detect_duplicates  # type: ignore
+except Exception:
+    compute_risk_score = None  # type: ignore
+    detect_duplicates = None  # type: ignore
+
 log = logging.getLogger(__name__)
 
 
@@ -66,6 +77,21 @@ class Orchestrator:
             keep_context_copy=True,
         )
         self.analitico = (AgenteAnalitico(self.llm, self.memoria) if (self.llm and AgenteAnalitico) else None)  # type: ignore
+
+        # RAG baseado em embeddings (se possível)
+        self.rag = None
+        if self.llm and SimpleRAG:
+            try:
+                # Inferir provider por atributo interno
+                prov = getattr(self.llm, "_provider", None)
+                key = None
+                if prov == "openai":
+                    key = os.getenv("OPENAI_API_KEY")
+                elif prov in {"gemini","google"}:
+                    key = os.getenv("GEMINI_API_KEY")
+                self.rag = SimpleRAG(self.db, prov, key)
+            except Exception:
+                self.rag = None
 
         if self.ONLY_XML:
             log.info("Orchestrator: Modo Somente XML ativo.")
@@ -175,6 +201,20 @@ class Orchestrator:
         if not safe_mode and self.analitico and self.llm:
             try:
                 catalog = self._build_catalog(scope_filters)
+                # RAG: opcional — fornece contexto recuperado como tabela 'rag_context'
+                try:
+                    if self.rag:
+                        # limitar escopo de documentos
+                        df_docs = catalog.get("documentos")
+                        scope_ids = df_docs["id"].astype(int).tolist() if (df_docs is not None and not df_docs.empty and "id" in df_docs.columns) else None
+                        if scope_ids:
+                            # indexar on-demand (primeira vez)
+                            self.rag.index_documents(scope_ids)
+                        rag_df = self.rag.query(pergunta, scope_doc_ids=scope_ids, top_k=6)
+                        if rag_df is not None and not rag_df.empty:
+                            catalog["rag_context"] = rag_df
+                except Exception:
+                    pass
                 out = self.analitico.responder(pergunta, catalog)
                 out["duracao_s"] = float(time.time() - t0)
                 out["agent_name"] = out.get("agent_name", "AgenteAnalitico")
@@ -281,12 +321,36 @@ class Orchestrator:
         else:
             bblog.append({"ts": time.time(), "msg": f"Status mantido: {status}."})
 
+        # 2.1) Agente de Risco/Duplicidade (heurístico, somente dados estruturados)
+        try:
+            risk_out = compute_risk_score(self.db, int(doc_id)) if compute_risk_score else {"risk_score": None, "signals": []}
+            dup_out = detect_duplicates(self.db, int(doc_id)) if detect_duplicates else {"duplicates": []}
+        except Exception:
+            risk_out = {"risk_score": None, "signals": []}
+            dup_out = {"duplicates": []}
+        if risk_out.get("signals"):
+            bblog.extend({"ts": time.time(), "msg": f"Risco: {s}"} for s in risk_out["signals"]) 
+
         # 3) Persistir decisões no meta_json
         patch = meta.copy()
         patch.setdefault("blackboard", {})
         patch["blackboard"].setdefault("decisions", [])
         patch["blackboard"]["decisions"].extend(bblog)
         patch.setdefault("quality", {"completeness": completeness, "critical_hits": crit_hits, "sanity": sanity})
+        if risk_out.get("risk_score") is not None:
+            patch.setdefault("risk", {})
+            patch["risk"]["score"] = float(risk_out["risk_score"])  # 0..1
+            try:
+                if isinstance(dup_out.get("duplicates"), list):
+                    patch["risk"]["duplicates"] = [int(x) for x in dup_out["duplicates"]]
+            except Exception:
+                pass
+            try:
+                if float(risk_out["risk_score"]) >= 0.6 and (doc.get("status") not in ("revisado",)):
+                    self.db.atualizar_documento_campos(doc_id, status="revisao_pendente")
+                    patch["blackboard"]["decisions"].append({"ts": time.time(), "msg": "Status ajustado por alto risco (>=0.6)."})
+            except Exception:
+                pass
         self._merge_meta_json(doc_id, patch)
 
     # --------------------------- Helpers ---------------------------
@@ -357,43 +421,191 @@ class Orchestrator:
             self._merge_meta_json(doc_id, meta_patch)
 
     def _safe_answer(self, pergunta: str, scope: Dict[str, Any]) -> tuple[str, Any, str]:
+        """
+        Respostas determinísticas comuns (SQL sobre SQLite) para perguntas frequentes.
+        Intents suportados (heurísticos, pt-BR):
+        - Top N emitentes/fornecedores por valor_total
+        - Totais por UF
+        - Totais por mês/ano (data_emissao)
+        - Totais por NCM/CFOP/CST (joins em itens/impostos)
+        - Top N itens por valor (com base em itens.valor_total)
+        - Resumo geral por tipo (fallback)
+        """
         # Importa pandas sob demanda para evitar hard-dependency no import do módulo
         import pandas as pd  # type: ignore
+        import re
 
-        where = []
+        # ---- Escopo base (UF, tipo) ----
+        where: list[str] = []
+        params: list[Any] = []
         if scope.get("uf"):
             uf = str(scope["uf"]).strip().upper()
             if uf:
-                where.append(f"(emitente_uf = '{uf}' OR destinatario_uf = '{uf}')")
+                where.append("(emitente_uf = ? OR destinatario_uf = ?)")
+                params.extend([uf, uf])
         tipos = scope.get("tipo") or []
-        if tipos:
-            tipos_sql = ", ".join([f"'{str(t).strip()}'" for t in tipos])
-            where.append(f"tipo IN ({tipos_sql})")
+        if isinstance(tipos, (list, tuple)) and tipos:
+            # Usa placeholders para cada tipo
+            where.append("tipo IN (" + ", ".join(["?"] * len(tipos)) + ")")
+            params.extend([str(t).strip() for t in tipos])
+
+        # ---- Heurísticas de período (ano/mês) extraídas do texto ----
+        qraw = pergunta or ""
+        q = qraw.lower()
+
+        # entre AAAA-MM e AAAA-MM
+        m_between = re.search(r"entre\s+(\d{4}-\d{2})\s+e\s+(\d{4}-\d{2})", q)
+        if m_between:
+            ini, fim = m_between.group(1), m_between.group(2)
+            where.append("substr(data_emissao,1,7) BETWEEN ? AND ?")
+            params.extend([ini, fim])
+        else:
+            # mês específico AAAA-MM
+            m_month = re.search(r"(\d{4}-\d{2})", q)
+            if m_month:
+                ym = m_month.group(1)
+                where.append("substr(data_emissao,1,7) = ?")
+                params.append(ym)
+            else:
+                # ano específico AAAA
+                m_year = re.search(r"\b(20\d{2}|19\d{2})\b", q)
+                if m_year:
+                    yyyy = m_year.group(1)
+                    where.append("substr(data_emissao,1,4) = ?")
+                    params.append(yyyy)
+
         where_clause = " AND ".join(where) if where else None
 
-        q = pergunta.lower()
-        if "top" in q and ("emitente" in q or "fornecedor" in q):
-            sql = "SELECT emitente_nome, SUM(COALESCE(valor_total,0)) AS total FROM documentos"
+        # ---- Top N helper ----
+        def topn_default(txt: str, default: int = 5) -> int:
+            m = re.search(r"top\s*(\d{1,3})", txt)
+            try:
+                if m:
+                    n = int(m.group(1))
+                    return max(1, min(n, 100))
+            except Exception:
+                pass
+            return default
+
+        # ---------- Intents específicas ----------
+        # 1) Top N emitentes/fornecedores por valor_total
+        if ("top" in q) and ("emitente" in q or "fornecedor" in q):
+            n = topn_default(q)
+            sql = (
+                "SELECT emitente_nome, SUM(COALESCE(valor_total,0)) AS total "
+                "FROM documentos"
+            )
             if where_clause:
                 sql += f" WHERE {where_clause}"
-            sql += " GROUP BY emitente_nome ORDER BY total DESC LIMIT 5"
-            df = pd.read_sql_query(sql, self.db.conn)
-            text = "Top emitentes por valor total."
+            sql += " GROUP BY emitente_nome ORDER BY total DESC LIMIT ?"
+            df = pd.read_sql_query(sql, self.db.conn, params=params + [n])
+            text = f"Top {n} emitentes por valor total."
             return sql, df, text
 
-        if "uf" in q and ("valor" in q or "faturamento" in q):
-            sql = "SELECT COALESCE(emitente_uf, destinatario_uf) AS uf, SUM(COALESCE(valor_total,0)) AS total FROM documentos"
+        # 2) Totais por UF
+        if ("uf" in q) and ("valor" in q or "faturamento" in q or "total" in q):
+            sql = (
+                "SELECT COALESCE(emitente_uf, destinatario_uf) AS uf, "
+                "SUM(COALESCE(valor_total,0)) AS total "
+                "FROM documentos"
+            )
             if where_clause:
                 sql += f" WHERE {where_clause}"
             sql += " GROUP BY uf ORDER BY total DESC"
-            df = pd.read_sql_query(sql, self.db.conn)
-            text = "Resumo por UF."
+            df = pd.read_sql_query(sql, self.db.conn, params=params)
+            text = "Resumo de valores por UF."
             return sql, df, text
 
+        # 3) Totais por mês
+        if ("mês" in q) or ("mensal" in q) or ("por mês" in q):
+            sql = (
+                "SELECT substr(data_emissao,1,7) AS mes, SUM(COALESCE(valor_total,0)) AS total "
+                "FROM documentos"
+            )
+            if where_clause:
+                sql += f" WHERE {where_clause}"
+            sql += " GROUP BY mes ORDER BY mes"
+            df = pd.read_sql_query(sql, self.db.conn, params=params)
+            text = "Totais por mês (YYYY-MM)."
+            return sql, df, text
+
+        # 4) Totais por ano
+        if ("ano" in q) or ("anual" in q) or ("por ano" in q):
+            sql = (
+                "SELECT substr(data_emissao,1,4) AS ano, SUM(COALESCE(valor_total,0)) AS total "
+                "FROM documentos"
+            )
+            if where_clause:
+                sql += f" WHERE {where_clause}"
+            sql += " GROUP BY ano ORDER BY ano"
+            df = pd.read_sql_query(sql, self.db.conn, params=params)
+            text = "Totais por ano."
+            return sql, df, text
+
+        # 5) Totais por NCM (itens)
+        if "ncm" in q:
+            n = topn_default(q, default=10)
+            sql = (
+                "SELECT i.ncm AS ncm, SUM(COALESCE(i.valor_total, i.quantidade*i.valor_unitario, 0)) AS total "
+                "FROM itens i JOIN documentos d ON d.id = i.documento_id"
+            )
+            if where_clause:
+                sql += f" WHERE {where_clause.replace('emitente_uf', 'd.emitente_uf').replace('destinatario_uf', 'd.destinatario_uf').replace('tipo', 'd.tipo').replace('data_emissao', 'd.data_emissao')}"
+            sql += " GROUP BY i.ncm ORDER BY total DESC LIMIT ?"
+            df = pd.read_sql_query(sql, self.db.conn, params=params + [n])
+            text = f"Top {n} NCM por valor de itens."
+            return sql, df, text
+
+        # 6) Totais por CFOP (itens)
+        if "cfop" in q:
+            n = topn_default(q, default=10)
+            sql = (
+                "SELECT i.cfop AS cfop, SUM(COALESCE(i.valor_total, i.quantidade*i.valor_unitario, 0)) AS total "
+                "FROM itens i JOIN documentos d ON d.id = i.documento_id"
+            )
+            if where_clause:
+                sql += f" WHERE {where_clause.replace('emitente_uf', 'd.emitente_uf').replace('destinatario_uf', 'd.destinatario_uf').replace('tipo', 'd.tipo').replace('data_emissao', 'd.data_emissao')}"
+            sql += " GROUP BY i.cfop ORDER BY total DESC LIMIT ?"
+            df = pd.read_sql_query(sql, self.db.conn, params=params + [n])
+            text = f"Top {n} CFOP por valor de itens."
+            return sql, df, text
+
+        # 7) Totais por CST (impostos por item)
+        if "cst" in q:
+            n = topn_default(q, default=10)
+            sql = (
+                "SELECT imp.cst AS cst, SUM(COALESCE(imp.valor, 0)) AS total_imposto, "
+                "SUM(COALESCE(i.valor_total, i.quantidade*i.valor_unitario, 0)) AS base_itens "
+                "FROM impostos imp "
+                "JOIN itens i ON i.id = imp.item_id "
+                "JOIN documentos d ON d.id = i.documento_id"
+            )
+            if where_clause:
+                sql += f" WHERE {where_clause.replace('emitente_uf', 'd.emitente_uf').replace('destinatario_uf', 'd.destinatario_uf').replace('tipo', 'd.tipo').replace('data_emissao', 'd.data_emissao')}"
+            sql += " GROUP BY imp.cst ORDER BY base_itens DESC LIMIT ?"
+            df = pd.read_sql_query(sql, self.db.conn, params=params + [n])
+            text = f"Top {n} CST por valor agregado de itens (e total de imposto)."
+            return sql, df, text
+
+        # 8) Top N itens por valor (descricao)
+        if ("top" in q) and ("item" in q or "produto" in q):
+            n = topn_default(q)
+            sql = (
+                "SELECT i.descricao AS item, SUM(COALESCE(i.valor_total, i.quantidade*i.valor_unitario, 0)) AS total "
+                "FROM itens i JOIN documentos d ON d.id = i.documento_id"
+            )
+            if where_clause:
+                sql += f" WHERE {where_clause.replace('emitente_uf', 'd.emitente_uf').replace('destinatario_uf', 'd.destinatario_uf').replace('tipo', 'd.tipo').replace('data_emissao', 'd.data_emissao')}"
+            sql += " GROUP BY i.descricao ORDER BY total DESC LIMIT ?"
+            df = pd.read_sql_query(sql, self.db.conn, params=params + [n])
+            text = f"Top {n} itens por valor."
+            return sql, df, text
+
+        # 9) Resumo geral por tipo de documento (fallback)
         sql = "SELECT tipo, COUNT(1) AS qtd, SUM(COALESCE(valor_total,0)) AS total FROM documentos"
         if where_clause:
             sql += f" WHERE {where_clause}"
         sql += " GROUP BY tipo ORDER BY total DESC"
-        df = pd.read_sql_query(sql, self.db.conn)
+        df = pd.read_sql_query(sql, self.db.conn, params=params)
         text = "Resumo por tipo de documento."
         return sql, df, text
